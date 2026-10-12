@@ -1,8 +1,8 @@
 ; NSIS installer for Peyara Server (Windows).
 ; Built in CI from packaging/windows/stage/ containing:
-;   peyara-egui.exe, icon.ico
-; Invoke: makensis /DVERSION=1.0.1 ..\installer.nsi
-; Output file lands next to this script; CI moves it to the repo root.
+;   installer.nsi (this file, copied in), peyara-egui.exe, icon.ico
+; Invoke from inside stage/: makensis /DVERSION=1.0.0 installer.nsi
+; Output file lands in packaging/windows/; CI moves it to the repo root.
 
 !ifndef VERSION
   !define VERSION "dev"

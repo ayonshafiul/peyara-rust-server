@@ -99,8 +99,11 @@ jobs:
           mkdir -p packaging/windows/stage
           cp target/x86_64-pc-windows-msvc/release/peyara-egui.exe packaging/windows/stage/
           cp assets/icon.ico packaging/windows/stage/
+          # Run from inside stage/: makensis resolves Icon/File relative to
+          # the script directory, so co-locating script + inputs is robust.
+          cp packaging/windows/installer.nsi packaging/windows/stage/
           cd packaging/windows/stage
-          MSYS2_ARG_CONV_EXCL="*" makensis "/DVERSION=${VER}" ../installer.nsi
+          MSYS2_ARG_CONV_EXCL="*" makensis "/DVERSION=${VER}" installer.nsi
           cd ../../..
           EXE=$(find . -maxdepth 3 -name "Peyara-Server-*-setup.exe" | head -1)
           mv "$EXE" "./Peyara-Server-${VER}-windows-x86_64-setup.exe"
