@@ -76,8 +76,22 @@ jobs:
         shell: powershell
         run: |
           if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
-            choco install nsis -y
+            choco install nsis -y --no-progress
           }
+          # choco only updates the registry PATH, which later steps do not
+          # inherit — export the install dir explicitly so makensis resolves.
+          $dir = $null
+          $found = Get-Command makensis -ErrorAction SilentlyContinue
+          if ($found) {
+            $dir = Split-Path $found.Source
+          } else {
+            foreach ($c in @("${env:ProgramFiles(x86)}\NSIS", "${env:ProgramFiles}\NSIS")) {
+              if (Test-Path (Join-Path $c "makensis.exe")) { $dir = $c; break }
+            }
+          }
+          if (-not $dir) { Write-Error "makensis.exe not found after install"; exit 1 }
+          Add-Content -Path $env:GITHUB_PATH -Value $dir
+          & (Join-Path $dir "makensis.exe") -VERSION | Select-Object -First 1
       - name: Build installer
         shell: bash
         run: |
@@ -86,7 +100,7 @@ jobs:
           cp target/x86_64-pc-windows-msvc/release/peyara-egui.exe packaging/windows/stage/
           cp assets/icon.ico packaging/windows/stage/
           cd packaging/windows/stage
-          makensis "/DVERSION=${VER}" ../installer.nsi
+          MSYS2_ARG_CONV_EXCL="*" makensis "/DVERSION=${VER}" ../installer.nsi
           cd ../../..
           EXE=$(find . -maxdepth 3 -name "Peyara-Server-*-setup.exe" | head -1)
           mv "$EXE" "./Peyara-Server-${VER}-windows-x86_64-setup.exe"
