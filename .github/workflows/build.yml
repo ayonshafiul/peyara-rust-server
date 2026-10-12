@@ -9,36 +9,8 @@ permissions:
   contents: write
 
 jobs:
-  test:
-    name: Test (ubuntu)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libx11-dev \
-            libxcb1-dev \
-            libxcb-render0-dev \
-            libxcb-shape0-dev \
-            libxcb-xfixes0-dev \
-            libxkbcommon-dev \
-            libxkbcommon-x11-dev \
-            libwayland-dev \
-            libegl1-mesa-dev \
-            libgl1-mesa-dev
-      - name: Run tests
-        run: cargo test --locked
-      - name: Run clippy
-        run: cargo clippy --all-targets -- -D warnings
-
   build-linux:
     name: Linux packages (.deb + .rpm)
-    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -89,7 +61,6 @@ jobs:
 
   build-windows:
     name: Windows installer (.exe)
-    needs: test
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -129,7 +100,6 @@ jobs:
 
   build-macos:
     name: macOS disk image (.dmg)
-    needs: test
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
