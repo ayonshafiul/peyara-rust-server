@@ -171,14 +171,22 @@ jobs:
     needs: [build-linux, build-windows, build-macos]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+      - name: Get version
+        id: version
+        shell: bash
+        run: echo "version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
       - name: Create public release
-        uses: softprops/action-gh-release@v2
+        uses: ncipollo/release-action@v1
         with:
-          tag_name: build-${{ github.run_number }}
-          name: Automated build #${{ github.run_number }} (main @ ${{ github.sha }})
-          generate_release_notes: true
-          files: dist/*
+          tag: v${{ steps.version.outputs.version }}
+          name: Peyara Server v${{ steps.version.outputs.version }}
+          allowUpdates: true
+          replacesArtifacts: true
+          makeLatest: true
+          generateReleaseNotes: true
+          artifacts: dist/*

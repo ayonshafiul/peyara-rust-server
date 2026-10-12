@@ -18,9 +18,11 @@ connection status and a text/clipboard exchange box.
 ## Releases
 
 Every `main` push builds native packages via GitHub Actions and publishes
-them as a public release: `.deb` + `.rpm` (Linux), NSIS `.exe` installer
-(Windows), `.dmg` (macOS arm64). Linux packages install the binary to
-`/usr/bin`, plus a desktop entry and the app icon.
+them to a public release tagged `v<version>` (taken from `Cargo.toml`, so
+bump the version there for a new release line; re-pushes refresh the same
+tag with the latest binaries): `.deb` + `.rpm` (Linux), NSIS `.exe`
+installer (Windows), `.dmg` (macOS arm64). Linux packages install the binary
+to `/usr/bin`, plus a desktop entry and the app icon.
 
 ## How it works
 
