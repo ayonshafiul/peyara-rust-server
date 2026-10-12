@@ -1,5 +1,10 @@
 # Peyara Server
 
+[![Build](https://github.com/ayonshafiul/peyara-rust-server/actions/workflows/build.yml/badge.svg)](https://github.com/ayonshafiul/peyara-rust-server/actions)
+[![Latest release](https://img.shields.io/github/v/release/ayonshafiul/peyara-rust-server)](https://github.com/ayonshafiul/peyara-rust-server/releases)
+[![Downloads](https://img.shields.io/github/downloads/ayonshafiul/peyara-rust-server/total)](https://github.com/ayonshafiul/peyara-rust-server/releases)
+[![License](https://img.shields.io/github/license/ayonshafiul/peyara-rust-server)](LICENSE)
+
 Turn your phone into a wireless touchpad, keyboard, and clipboard for your
 PC. Peyara Server runs on your desktop and pairs with the [Peyara mobile
 app](https://peyara-remote-mouse.vercel.app/) over your local network —
@@ -21,7 +26,7 @@ unchanged. Screen sharing was intentionally dropped to keep it light.
 ## Download
 
 Grab the latest release for your OS from the [**Releases**
-page](../../releases):
+page](https://github.com/ayonshafiul/peyara-rust-server/releases):
 
 | OS | File | Install |
 |---|---|---|
