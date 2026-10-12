@@ -245,6 +245,9 @@ impl eframe::App for PeyaraApp {
             (AMBER, "waiting for phone…".to_owned())
         };
 
+        // Text boxes scale with the window instead of fixed row counts.
+        let text_h = (ctx.available_rect().height() * 0.16).clamp(80.0, 240.0);
+
         // ── Top bar ──────────────────────────────────────────────
         egui::TopBottomPanel::top("topbar")
             .frame(egui::Frame {
@@ -368,9 +371,10 @@ impl eframe::App for PeyaraApp {
                     // Text sharing.
                     card_frame().show(ui, |ui| {
                         section_title(ui, "✉", "Send text to phone");
-                        ui.add(
+                        ui.add_sized(
+                            [ui.available_width(), text_h],
                             egui::TextEdit::multiline(&mut self.outgoing)
-                                .desired_rows(3)
+                                .desired_width(f32::INFINITY)
                                 .hint_text("Type here to send text to phone…"),
                         );
                         ui.add_space(4.0);
@@ -402,9 +406,10 @@ impl eframe::App for PeyaraApp {
                     // Incoming text from the phone.
                     card_frame().show(ui, |ui| {
                         section_title(ui, "↓", "From phone");
-                        ui.add(
+                        ui.add_sized(
+                            [ui.available_width(), text_h],
                             egui::TextEdit::multiline(&mut self.incoming)
-                                .desired_rows(3)
+                                .desired_width(f32::INFINITY)
                                 .hint_text("Incoming phone text appears here…"),
                         );
                         ui.add_space(4.0);
