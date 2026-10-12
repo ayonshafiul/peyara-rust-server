@@ -1,0 +1,11 @@
+# Rust build output
+/target/
+
+# Editor / OS noise
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local env
+.env
