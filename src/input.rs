@@ -65,10 +65,17 @@ pub fn map_named_key(name: &str) -> Option<Key> {
         "alt" | "option" => Key::Alt,
         "command" | "cmd" | "meta" | "super" | "windows" | "win" => Key::Meta,
         "capslock" => Key::CapsLock,
+        // Insert/Pause/PrintScr/Numlock exist everywhere except macOS;
+        // ScrollLock is Unix-only (also absent on Windows).
+        #[cfg(not(target_os = "macos"))]
         "insert" => Key::Insert,
+        #[cfg(not(target_os = "macos"))]
         "pause" => Key::Pause,
+        #[cfg(not(target_os = "macos"))]
         "printscreen" | "printscr" => Key::PrintScr,
+        #[cfg(all(unix, not(target_os = "macos")))]
         "scrolllock" => Key::ScrollLock,
+        #[cfg(not(target_os = "macos"))]
         "numlock" => Key::Numlock,
         f if f.len() == 2 && f.starts_with('f') => match &f[1..] {
             "1" => Key::F1,
@@ -113,6 +120,8 @@ pub fn map_media_key(name: &str) -> Option<Key> {
         "audio_vol_down" => Key::VolumeDown,
         "audio_vol_up" => Key::VolumeUp,
         "audio_play" | "audio_pause" => Key::MediaPlayPause,
+        // No stop key on macOS — the name is ignored there.
+        #[cfg(not(target_os = "macos"))]
         "audio_stop" => Key::MediaStop,
         "audio_prev" => Key::MediaPrevTrack,
         "audio_next" => Key::MediaNextTrack,
@@ -307,12 +316,12 @@ mod tests {
 
     #[test]
     fn media_keys_allowlist_matches_original() {
-        for name in [
+        // audio_stop has no key on macOS (enigo omits MediaStop there).
+        let mut names = vec![
             "audio_mute",
             "audio_vol_down",
             "audio_vol_up",
             "audio_play",
-            "audio_stop",
             "audio_pause",
             "audio_prev",
             "audio_next",
@@ -320,9 +329,14 @@ mod tests {
             "down",
             "left",
             "right",
-        ] {
+        ];
+        #[cfg(not(target_os = "macos"))]
+        names.push("audio_stop");
+        for name in names {
             assert!(map_media_key(name).is_some(), "{name}");
         }
+        #[cfg(target_os = "macos")]
+        assert!(map_media_key("audio_stop").is_none());
         assert!(map_media_key("audio_rewind").is_none());
         assert_eq!(map_media_key("audio_mute"), Some(Key::VolumeMute));
         assert_eq!(map_media_key("audio_prev"), Some(Key::MediaPrevTrack));
