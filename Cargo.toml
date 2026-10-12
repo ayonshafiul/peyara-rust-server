@@ -11,6 +11,26 @@ rust-version = "1.85"
 name = "peyara-egui"
 path = "src/main.rs"
 
+[package.metadata.deb]
+maintainer = "Shafiul Muslebeen"
+copyright = "2026, Shafiul Muslebeen"
+license-file = []
+section = "utils"
+priority = "optional"
+depends = "$auto"
+assets = [
+  ["target/release/peyara-egui", "usr/bin/", "755"],
+  ["assets/icon.png", "usr/share/icons/hicolor/512x512/apps/peyara-egui.png", "644"],
+  ["assets/peyara-egui.desktop", "usr/share/applications/", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+  { source = "target/release/peyara-egui", dest = "/usr/bin/peyara-egui", mode = "755" },
+  { source = "assets/icon.png", dest = "/usr/share/icons/hicolor/512x512/apps/peyara-egui.png", mode = "644" },
+  { source = "assets/peyara-egui.desktop", dest = "/usr/share/applications/peyara-egui.desktop", mode = "644" },
+]
+
 [dependencies]
 eframe = "0.32"
 egui = "0.32"

@@ -36,36 +36,18 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets -- -D warnings
 
-  build:
-    name: Build (${{ matrix.name }})
+  build-linux:
+    name: Linux packages (.deb + .rpm)
     needs: test
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: linux-x86_64
-            os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            bin: peyara-egui
-            archive: peyara-egui-linux-x86_64.tar.gz
-          - name: windows-x86_64
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
-            bin: peyara-egui.exe
-            archive: peyara-egui-windows-x86_64.zip
-          - name: macos-arm64
-            os: macos-latest
-            target: aarch64-apple-darwin
-            bin: peyara-egui
-            archive: peyara-egui-macos-arm64.tar.gz
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - name: Install system dependencies (linux)
-        if: runner.os == 'Linux'
+      - name: Get version
+        id: version
+        shell: bash
+        run: echo "version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_OUTPUT"
+      - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -79,28 +61,114 @@ jobs:
             libwayland-dev \
             libegl1-mesa-dev \
             libgl1-mesa-dev
-      - name: Build release
-        run: cargo build --locked --release --target ${{ matrix.target }}
-      - name: Package (linux/macos)
-        if: runner.os != 'Windows'
+      - name: Build release binary
+        run: cargo build --locked --release
+      - name: Build .deb and .rpm
         run: |
-          cd target/${{ matrix.target }}/release
-          tar -czf ../../../${{ matrix.archive }} ${{ matrix.bin }}
-      - name: Package (windows)
-        if: runner.os == 'Windows'
+          cargo install cargo-deb cargo-generate-rpm
+          cargo deb
+          cargo generate-rpm
+      - name: Rename packages
+        shell: bash
         run: |
-          cd target/${{ matrix.target }}/release
-          Compress-Archive -Path ${{ matrix.bin }} -DestinationPath ../../../${{ matrix.archive }}
-      - name: Upload artifact
+          VER="${{ steps.version.outputs.version }}"
+          mv target/debian/peyara-egui_*.deb "Peyara-Server-${VER}-linux-amd64.deb"
+          mv target/generate-rpm/*.rpm "Peyara-Server-${VER}-linux-x86_64.rpm"
+      - name: Upload .deb
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.archive }}
-          path: ${{ matrix.archive }}
+          name: Peyara-Server-${{ steps.version.outputs.version }}-linux-amd64.deb
+          path: Peyara-Server-*-linux-amd64.deb
+          retention-days: 30
+      - name: Upload .rpm
+        uses: actions/upload-artifact@v4
+        with:
+          name: Peyara-Server-${{ steps.version.outputs.version }}-linux-x86_64.rpm
+          path: Peyara-Server-*-linux-x86_64.rpm
+          retention-days: 30
+
+  build-windows:
+    name: Windows installer (.exe)
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Get version
+        id: version
+        shell: bash
+        run: echo "version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_OUTPUT"
+      - name: Build release binary
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc
+      - name: Ensure NSIS
+        shell: powershell
+        run: |
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
+            choco install nsis -y
+          }
+      - name: Build installer
+        shell: bash
+        run: |
+          VER="${{ steps.version.outputs.version }}"
+          mkdir -p packaging/windows/stage
+          cp target/x86_64-pc-windows-msvc/release/peyara-egui.exe packaging/windows/stage/
+          cp assets/icon.ico packaging/windows/stage/
+          cd packaging/windows/stage
+          makensis "/DVERSION=${VER}" ../installer.nsi
+          cd ../../..
+          EXE=$(find . -maxdepth 3 -name "Peyara-Server-*-setup.exe" | head -1)
+          mv "$EXE" "./Peyara-Server-${VER}-windows-x86_64-setup.exe"
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Peyara-Server-${{ steps.version.outputs.version }}-windows-x86_64-setup.exe
+          path: Peyara-Server-*-setup.exe
+          retention-days: 30
+
+  build-macos:
+    name: macOS disk image (.dmg)
+    needs: test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - name: Get version
+        id: version
+        shell: bash
+        run: echo "version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_OUTPUT"
+      - name: Build release binary
+        run: cargo build --locked --release --target aarch64-apple-darwin
+      - name: Build DMG
+        shell: bash
+        run: |
+          VER="${{ steps.version.outputs.version }}"
+          rm -rf dmg-staging
+          mkdir -p "dmg-staging/Peyara Server.app/Contents/MacOS" \
+                   "dmg-staging/Peyara Server.app/Contents/Resources"
+          cp target/aarch64-apple-darwin/release/peyara-egui \
+             "dmg-staging/Peyara Server.app/Contents/MacOS/"
+          cp assets/icon.icns \
+             "dmg-staging/Peyara Server.app/Contents/Resources/Peyara.icns"
+          sed "s/__VERSION__/${VER}/g" packaging/macos/Info.plist \
+            > "dmg-staging/Peyara Server.app/Contents/Info.plist"
+          codesign --force --deep --sign - "dmg-staging/Peyara Server.app"
+          ln -s /Applications "dmg-staging/Applications"
+          hdiutil create -volname "Peyara Server" -srcfolder dmg-staging \
+            -ov -format UDZO "Peyara-Server-${VER}-macos-arm64.dmg"
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: Peyara-Server-${{ steps.version.outputs.version }}-macos-arm64.dmg
+          path: Peyara-Server-*.dmg
           retention-days: 30
 
   release:
     name: Publish release
-    needs: build
+    needs: [build-linux, build-windows, build-macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

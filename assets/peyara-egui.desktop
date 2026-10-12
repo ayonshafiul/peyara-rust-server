@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Peyara Server
+Comment=Control your PC mouse, keyboard and clipboard from your phone
+Exec=peyara-egui
+Icon=peyara-egui
+Categories=Utility;
+Terminal=false
+StartupNotify=true

@@ -13,8 +13,14 @@ cargo run --release
 ```
 
 Scan the on-screen QR code with the phone app. The window also shows
-connection status, a text/clipboard exchange box and the incoming-files
-directory.
+connection status and a text/clipboard exchange box.
+
+## Releases
+
+Every `main` push builds native packages via GitHub Actions and publishes
+them as a public release: `.deb` + `.rpm` (Linux), NSIS `.exe` installer
+(Windows), `.dmg` (macOS arm64). Linux packages install the binary to
+`/usr/bin`, plus a desktop entry and the app icon.
 
 ## How it works
 
