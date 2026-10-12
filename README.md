@@ -128,4 +128,4 @@ is a separate codebase — call it out in the PR.
 
 ## License
 
-ISC — see [LICENSE](LICENSE). Copyright (c) 2026 Shafiul Muslebeen.
+MIT — see [LICENSE](LICENSE). Copyright (c) 2026 Shafiul Muslebeen.
