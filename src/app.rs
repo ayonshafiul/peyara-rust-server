@@ -144,13 +144,15 @@ impl PeyaraApp {
         }
     }
 
-    fn poll_channels(&mut self) {
+    fn poll_channels(&mut self, ctx: &egui::Context) {
         loop {
             match self.ui_rx.try_recv() {
                 Ok(UiEvent::IncomingText(text)) => {
                     self.incoming = text;
                     self.set_status("Text received from phone.");
                     self.push_log("text received from phone");
+                    // Bring the window forward so the text is seen immediately.
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
                 Ok(UiEvent::Log(line)) => self.push_log(line),
                 Err(TryRecvError::Empty) => break,
@@ -231,7 +233,7 @@ fn section_title(ui: &mut egui::Ui, icon: &str, title: &str) {
 
 impl eframe::App for PeyaraApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_channels();
+        self.poll_channels(ctx);
         let clients = self.shared.clients.load(Ordering::SeqCst);
         let (dot_color, status_text) = if clients > 0 {
             (
