@@ -8,8 +8,8 @@
 use enigo::{Button, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use std::sync::mpsc::{self, Sender};
 
-/// Commands sent by the mobile client (mirrors the socket.io events of the
-/// original Electron server in `src/main.js`).
+/// Commands sent by the mobile client (mirrors the WebSocket `type` messages
+/// documented in `docs/websocket-client-migration.md`).
 #[derive(Debug, Clone)]
 pub enum InputCommand {
     /// Relative mouse movement (`coordinates` event, `{x, y}` pixels).

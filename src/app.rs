@@ -6,7 +6,6 @@ use egui::{
     vec2, Align, Color32, ColorImage, CornerRadius, Layout, Margin, RichText, Sense, Stroke,
     TextureHandle, TextureOptions,
 };
-use socketioxide::SocketIo;
 use std::sync::{
     atomic::Ordering,
     mpsc::{Receiver, TryRecvError},
@@ -52,8 +51,6 @@ pub fn qr_image(payload: &str) -> ColorImage {
 
 pub struct PeyaraApp {
     shared: Arc<Shared>,
-    io: SocketIo,
-    rt: tokio::runtime::Handle,
     qr: TextureHandle,
     host: String,
     urls: Vec<String>,
@@ -68,8 +65,6 @@ pub struct PeyaraApp {
 /// Constructor bundle for [`PeyaraApp`] (keeps the arg list small).
 pub struct AppInit {
     pub shared: Arc<Shared>,
-    pub io: SocketIo,
-    pub rt: tokio::runtime::Handle,
     pub qr_payload: String,
     pub host: String,
     pub urls: Vec<String>,
@@ -115,8 +110,6 @@ impl PeyaraApp {
         theme(&cc.egui_ctx);
         let AppInit {
             shared,
-            io,
-            rt,
             qr_payload,
             host,
             urls,
@@ -130,8 +123,6 @@ impl PeyaraApp {
         );
         Self {
             shared,
-            io,
-            rt,
             qr,
             host,
             urls,
@@ -181,18 +172,13 @@ impl PeyaraApp {
             self.set_status("Type something first.");
             return;
         }
-        match self
-            .rt
-            .block_on(self.io.emit("text-mobile", &self.outgoing))
-        {
-            Ok(()) => {
-                self.set_status("Sent to phone.");
-                self.push_log("text sent to phone");
-            }
-            Err(e) => {
-                self.set_status("Send failed — is a phone connected?");
-                self.push_log(format!("send failed: {e}"));
-            }
+        let receivers = self.shared.send_to_phone(&self.outgoing);
+        if receivers > 0 {
+            self.set_status("Sent to phone.");
+            self.push_log("text sent to phone");
+        } else {
+            self.set_status("Send failed — is a phone connected?");
+            self.push_log("send failed: no ws clients");
         }
         self.outgoing.clear();
     }

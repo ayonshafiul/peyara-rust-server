@@ -21,25 +21,26 @@ fn main() {
     let (ui_tx, ui_rx) = mpsc::channel::<UiEvent>();
 
     // 2. Shared state.
+    let (mobile_tx, _) = tokio::sync::broadcast::channel::<String>(16);
     let shared = Arc::new(Shared {
         clients: AtomicUsize::new(0),
         input_tx,
         ui_tx,
+        mobile_tx,
     });
 
-    // 3. Tokio runtime + server task (axum + socket.io on :1313).
+    // 3. Tokio runtime + server task (axum + native WS on :1313).
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("tokio runtime");
-    let (app_router, io) = server::build(shared.clone());
+    let app_router = server::build(shared.clone());
     rt.spawn(async move {
         if let Err(e) = server::serve(app_router).await {
             eprintln!("server error: {e}");
             std::process::exit(1);
         }
     });
-    let rt_handle = rt.handle().clone();
     // `rt` stays alive on the stack until the window closes.
 
     // 4. Discover LAN addresses and verify them against the live server,
@@ -83,8 +84,6 @@ fn main() {
                 cc,
                 app::AppInit {
                     shared: shared.clone(),
-                    io: io.clone(),
-                    rt: rt_handle.clone(),
                     qr_payload: qr_payload.clone(),
                     host: host.clone(),
                     urls: urls.clone(),

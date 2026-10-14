@@ -86,14 +86,16 @@ under that tag. The tag must match the `version` in `Cargo.toml`
 |---|---|
 | GUI | `eframe` / `egui` |
 | QR code | `qrcode` (pure Rust, rendered to an egui texture) |
-| HTTP + socket.io server | `axum` + `socketioxide` (v4 protocol compat) |
+| HTTP + WebSocket server | `axum` (native WebSockets, `GET /ws`) |
 | Mouse / keyboard | `enigo` on a dedicated worker thread |
 | Clipboard | `arboard` |
 
-Phone → PC events: `coordinates`, `clicks`, `scroll`,
+Phone → PC messages (JSON over `ws://<host>:1313/ws`): `coordinates`, `clicks`, `scroll`,
 `windowdragstart`/`windowdragupdate`/`windowdragend`, `key`, `media-key`,
 `edit-key`, `text`. PC → phone: `text-mobile`. `GET /` answers `"peyara"`
-for discovery/QR verification.
+for discovery/QR verification. See
+[`docs/websocket-client-migration.md`](docs/websocket-client-migration.md)
+for the exact shapes (replaces the old socket.io protocol).
 
 ## Wayland (Ubuntu 24 default session)
 
@@ -114,7 +116,7 @@ reports the detected session type and backend status. As a fallback, pick
 ## Project layout
 
 - `src/main.rs` — startup: input thread, Tokio server task, QR payload, window
-- `src/server.rs` — HTTP + socket.io routes (same wire protocol as `src/main.js`)
+- `src/server.rs` — HTTP + WebSocket routes (`GET /`, `GET /ws`)
 - `src/input.rs` — phone commands → `enigo` key/button mapping
 - `src/netinfo.rs` — LAN addresses, QR payload (`version,<peyara>,host,urls…`)
 - `src/app.rs` — egui window

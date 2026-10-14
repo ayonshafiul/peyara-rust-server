@@ -35,8 +35,8 @@ assets = [
 eframe = "0.32"
 egui = "0.32"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "fs", "sync", "io-util"] }
-axum = "0.8"
-socketioxide = { version = "0.18", features = ["v4", "state", "extensions"] }
+axum = { version = "0.8", features = ["ws"] }
+futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 enigo = { version = "0.6", features = ["libei_tokio"] }
