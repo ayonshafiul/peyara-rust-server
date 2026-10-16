@@ -8,13 +8,15 @@ use egui::{
 };
 use std::sync::{
     atomic::Ordering,
-    mpsc::{Receiver, TryRecvError},
+    mpsc::{Receiver, Sender, TryRecvError},
     Arc,
 };
+use std::time::{Duration, Instant};
 
 use crate::{
-    netinfo::{self},
+    netinfo::{self, LanAddr},
     server::{Shared, UiEvent},
+    ServerCtl,
 };
 
 const PLAY_STORE_URL: &str =
@@ -49,25 +51,46 @@ pub fn qr_image(payload: &str) -> ColorImage {
     }
 }
 
+/// Result of a background network refresh (verify runs off the UI thread).
+struct NetUpdate {
+    urls: Vec<String>,
+    fingerprint: String,
+    pairing: String,
+}
+
 pub struct PeyaraApp {
     shared: Arc<Shared>,
+    ctl: Arc<ServerCtl>,
     qr: TextureHandle,
+    qr_payload: String,
     host: String,
+    addrs: Vec<LanAddr>,
     urls: Vec<String>,
+    fingerprint: String,
+    pairing: String,
     outgoing: String,
     incoming: String,
     status_line: String,
     log: Vec<String>,
     ui_rx: Receiver<UiEvent>,
     worker_log_rx: Receiver<String>,
+    net_tx: Sender<NetUpdate>,
+    net_rx: Receiver<NetUpdate>,
+    net_pending: bool,
+    last_net_poll: Instant,
+    regen_confirm: bool,
 }
 
 /// Constructor bundle for [`PeyaraApp`] (keeps the arg list small).
 pub struct AppInit {
     pub shared: Arc<Shared>,
+    pub ctl: Arc<ServerCtl>,
     pub qr_payload: String,
     pub host: String,
+    pub addrs: Vec<LanAddr>,
     pub urls: Vec<String>,
+    pub fingerprint: String,
+    pub pairing: String,
     pub ui_rx: Receiver<UiEvent>,
     pub worker_log_rx: Receiver<String>,
 }
@@ -110,9 +133,13 @@ impl PeyaraApp {
         theme(&cc.egui_ctx);
         let AppInit {
             shared,
+            ctl,
             qr_payload,
             host,
+            addrs,
             urls,
+            fingerprint,
+            pairing,
             ui_rx,
             worker_log_rx,
         } = init;
@@ -121,18 +148,121 @@ impl PeyaraApp {
             qr_image(&qr_payload),
             TextureOptions::default(),
         );
+        let (net_tx, net_rx) = std::sync::mpsc::channel::<NetUpdate>();
         Self {
             shared,
+            ctl,
             qr,
+            qr_payload,
             host,
+            addrs,
             urls,
+            fingerprint,
+            pairing,
             outgoing: String::new(),
             incoming: String::new(),
             status_line: "Ready — scan the QR code with your phone.".to_owned(),
-            log: vec!["server listening on port 1313".to_owned()],
+            log: vec!["https + wss listening on port 1313".to_owned()],
             ui_rx,
             worker_log_rx,
+            net_tx,
+            net_rx,
+            net_pending: false,
+            last_net_poll: Instant::now(),
+            regen_confirm: false,
         }
+    }
+
+    fn rebuild_qr(&mut self, ctx: &egui::Context) {
+        self.qr_payload = netinfo::qr_payload(
+            netinfo::app_version(),
+            &self.host,
+            &self.fingerprint,
+            &self.pairing,
+            &self.urls,
+        );
+        self.qr = ctx.load_texture(
+            "peyara-qr",
+            qr_image(&self.qr_payload),
+            TextureOptions::default(),
+        );
+    }
+
+    /// Re-enumerate addresses and re-verify them on a worker thread, then
+    /// rebuild the QR. Regenerates the certificate first when forced or when
+    /// the address set changed (new IPs need new SANs baked into the cert).
+    fn start_net_refresh(&mut self, force_regen: bool) {
+        if self.net_pending {
+            self.set_status("Refresh already running…");
+            return;
+        }
+        let fresh = netinfo::lan_addrs();
+        let (fp, code) = if force_regen || fresh != self.addrs {
+            let sans: Vec<String> = fresh.iter().map(|a| a.ip.clone()).collect();
+            match self.ctl.regenerate(&sans) {
+                Ok((b, c)) => {
+                    self.push_log("certificate + pairing code regenerated; phones must re-scan");
+                    (b.fingerprint.clone(), c)
+                }
+                Err(e) => {
+                    self.set_status("Certificate regeneration failed.");
+                    self.push_log(format!("cert regen failed: {e}"));
+                    return;
+                }
+            }
+        } else {
+            let bundle = self.ctl.current();
+            (bundle.fingerprint.clone(), self.ctl.pairing())
+        };
+        self.addrs = fresh.clone();
+        self.fingerprint = fp.clone();
+        self.pairing = code.clone();
+        self.net_pending = true;
+        self.set_status("Refreshing network…");
+        let tx = self.net_tx.clone();
+        let shared = self.shared.clone();
+        let cert_der = self.ctl.current().cert_der.clone();
+        std::thread::spawn(move || {
+            let checks = netinfo::verify_all(&fresh, &cert_der);
+            for c in &checks {
+                if c.verified {
+                    shared.log(format!("net: {} ok ({})", c.url, c.addr.name));
+                } else if c.physical {
+                    shared.log(format!(
+                        "net: {} unverified — phone will still try it",
+                        c.url
+                    ));
+                }
+            }
+            let mut urls = netinfo::urls_from_checks(&checks);
+            if urls.is_empty() {
+                urls = netinfo::candidate_urls(&fresh);
+            }
+            let _ = tx.send(NetUpdate {
+                urls,
+                fingerprint: fp,
+                pairing: code,
+            });
+        });
+    }
+
+    /// Apply a finished background refresh (runs on the UI thread).
+    fn apply_net_update(&mut self, ctx: &egui::Context, u: NetUpdate) {
+        self.net_pending = false;
+        self.urls = u.urls;
+        self.fingerprint = u.fingerprint;
+        self.pairing = u.pairing;
+        self.rebuild_qr(ctx);
+        self.set_status("Network refreshed — scan the QR code.");
+        self.push_log("network refreshed");
+    }
+
+    fn iface_for_url(&self, url: &str) -> Option<&str> {
+        let host = netinfo::url_host(url);
+        self.addrs
+            .iter()
+            .find(|a| a.ip == host)
+            .map(|a| a.name.as_str())
     }
 
     fn poll_channels(&mut self, ctx: &egui::Context) {
@@ -220,6 +350,23 @@ fn section_title(ui: &mut egui::Ui, icon: &str, title: &str) {
 impl eframe::App for PeyaraApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_channels(ctx);
+        // Apply finished background network refreshes (take the latest).
+        let mut latest: Option<NetUpdate> = None;
+        while let Ok(u) = self.net_rx.try_recv() {
+            latest = Some(u);
+        }
+        if let Some(u) = latest {
+            self.apply_net_update(ctx, u);
+        }
+        // Re-enumerate occasionally: Wi-Fi/VPN/DHCP changes alter the address
+        // set, which needs a new certificate (SANs are baked in) and QR.
+        if !self.net_pending && self.last_net_poll.elapsed() > Duration::from_secs(15) {
+            self.last_net_poll = Instant::now();
+            if netinfo::lan_addrs() != self.addrs {
+                self.push_log("network change detected — refreshing");
+                self.start_net_refresh(false);
+            }
+        }
         let clients = self.shared.clients.load(Ordering::SeqCst);
         let (dot_color, status_text) = if clients > 0 {
             (
@@ -305,31 +452,105 @@ impl eframe::App for PeyaraApp {
                                 .size(12.0)
                                 .color(MUTED),
                         );
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new("🔒 Secure (https + wss, pinned cert)")
+                                .size(11.5)
+                                .color(MUTED),
+                        );
+                        ui.add_space(4.0);
+                        if ui
+                            .add_sized(
+                                [ui.available_width(), 30.0],
+                                egui::Button::new("Regenerate certificate")
+                                    .corner_radius(CornerRadius::same(8)),
+                            )
+                            .clicked()
+                        {
+                            self.regen_confirm = true;
+                        }
                     });
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("PAIRING CODE")
+                            .size(11.0)
+                            .color(MUTED)
+                            .strong(),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(&self.pairing)
+                                .monospace()
+                                .size(22.0)
+                                .strong()
+                                .color(ACCENT),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.small_button("Copy").clicked() {
+                                let code = self.pairing.clone();
+                                self.copy_to_clipboard(&code, "Pairing code");
+                            }
+                        });
+                    });
+                    ui.label(
+                        RichText::new("Enter this on the phone if the camera can't scan.")
+                            .size(11.0)
+                            .color(MUTED),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("CERT SHA-256 FINGERPRINT")
+                            .size(11.0)
+                            .color(MUTED)
+                            .strong(),
+                    );
+                    ui.label(
+                        RichText::new(&self.fingerprint)
+                            .monospace()
+                            .size(9.5)
+                            .color(MUTED),
+                    );
+                    if ui.small_button("Copy fingerprint").clicked() {
+                        let fp = self.fingerprint.clone();
+                        self.copy_to_clipboard(&fp, "Fingerprint");
+                    }
                 });
                 ui.add_space(10.0);
-                ui.label(
-                    RichText::new("SERVER ADDRESSES")
-                        .size(12.0)
-                        .color(MUTED)
-                        .strong(),
-                );
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("SERVER ADDRESSES")
+                            .size(12.0)
+                            .color(MUTED)
+                            .strong(),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button("Refresh network").clicked() {
+                            self.start_net_refresh(false);
+                        }
+                    });
+                });
                 ui.add_space(2.0);
                 if self.urls.is_empty() {
                     ui.label(RichText::new("No network found.").color(MUTED));
                 }
                 for url in self.urls.clone() {
+                    let iface = self.iface_for_url(&url).unwrap_or("?").to_owned();
                     card_frame()
                         .inner_margin(Margin::symmetric(10, 8))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                ui.monospace(RichText::new(&url).size(12.5));
+                                ui.monospace(RichText::new(&url).size(11.5));
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     if ui.small_button("Copy").clicked() {
                                         self.copy_to_clipboard(&url, "Address");
                                     }
                                 });
                             });
+                            ui.label(
+                                RichText::new(format!("interface: {iface}"))
+                                    .size(10.5)
+                                    .color(MUTED),
+                            );
                         });
                     ui.add_space(6.0);
                 }
@@ -429,6 +650,39 @@ impl eframe::App for PeyaraApp {
                     });
                 });
             });
+
+        // Regenerate confirmation dialog.
+        if self.regen_confirm {
+            let n = self.shared.clients.load(Ordering::SeqCst);
+            let msg = if n == 0 {
+                "No phones are connected.\nA new certificate and pairing code will be issued \
+                 and the QR code will change."
+                    .to_owned()
+            } else {
+                format!(
+                    "This will disconnect {n} phone{}.\nThey must scan the QR code again \
+                     to reconnect. Continue?",
+                    if n == 1 { "" } else { "s" }
+                )
+            };
+            egui::Window::new("Regenerate certificate?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.label(msg);
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Regenerate").clicked() {
+                            self.regen_confirm = false;
+                            self.start_net_refresh(true);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.regen_confirm = false;
+                        }
+                    });
+                });
+        }
 
         // Keep client count fresh.
         ctx.request_repaint_after(std::time::Duration::from_secs(1));

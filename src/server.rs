@@ -1,12 +1,23 @@
-//! Network server: HTTP + native WebSocket on port 1313.
+//! Network server: HTTPS + secure WebSocket (`wss`) on port 1313.
 //!
-//! Wire protocol (all frames are UTF-8 JSON text over `GET /ws`):
+//! TLS-only: there is no plaintext listener. The certificate is ephemeral
+//! (generated per launch, regenerable from the UI) and the phone pins it via
+//! the fingerprint in the QR code — see `crate::tls` and
+//! `docs/qr-code-format.md`.
 //!
-//! * `GET /` returns JSON `"peyara"` (server discovery / QR verification).
-//! * Phone -> server: `{"type": "<event>", ...}` where `<event>` is one of
-//!   `coordinates`, `clicks`, `scroll`, `windowdragstart`,
-//!   `windowdragupdate`, `windowdragend`, `key`, `media-key`, `edit-key`,
-//!   `text` (see `docs/websocket-client-migration.md` for shapes).
+//! Every connection must then pair: its first message must be
+//! `{"type":"hello","pair":"<8hex>"}` echoing the pairing code from the QR.
+//! Anything else (or three bad codes, or 10s of silence) closes the
+//! connection before it can send input or receive clipboard text.
+//!
+//! Wire protocol (all frames are UTF-8 JSON text over `wss://<host>:1313/ws`):
+//!
+//! * `GET https://<host>:1313/` returns JSON `"peyara"` (discovery / QR verify).
+//! * Phone -> server: first `hello`, then `{"type": "<event>", ...}` where
+//!   `<event>` is one of `coordinates`, `clicks`, `scroll`,
+//!   `windowdragstart`, `windowdragupdate`, `windowdragend`, `key`,
+//!   `media-key`, `edit-key`, `text` (see
+//!   `docs/websocket-client-migration.md` for shapes).
 //! * Server -> phone: `{"type": "text-mobile", "text": "..."}`.
 //!
 //! Screen-sharing signalling (`offer`/`answer`/ICE) from the original is
@@ -21,20 +32,18 @@ use axum::{
     routing::get,
     Json,
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, Stream, StreamExt};
 use serde_json::Value;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     mpsc::Sender,
-    Arc, Mutex,
+    Arc, Mutex, RwLock,
 };
-use tokio::sync::broadcast;
+use std::time::Duration;
+use tokio::sync::{broadcast, watch};
 
-use crate::{
-    input::{
-        map_button, map_media_key, map_modifier, resolve_edit_key, resolve_key_event, InputCommand,
-    },
-    netinfo::PORT,
+use crate::input::{
+    map_button, map_media_key, map_modifier, resolve_edit_key, resolve_key_event, InputCommand,
 };
 
 /// Events forwarded from the server thread to the egui UI thread.
@@ -48,7 +57,7 @@ pub enum UiEvent {
 
 /// State shared between the server tasks and the UI thread.
 pub struct Shared {
-    /// Currently connected WebSocket clients.
+    /// Currently connected (paired) WebSocket clients.
     pub clients: AtomicUsize,
     /// Channel into the enigo input worker thread.
     pub input_tx: Sender<InputCommand>,
@@ -56,6 +65,16 @@ pub struct Shared {
     pub ui_tx: Sender<UiEvent>,
     /// Fan-out for desktop -> phone text (`text-mobile`).
     pub mobile_tx: broadcast::Sender<String>,
+    /// Current 8-digit hex pairing code (QR `pair:` field). Rotated on
+    /// launch and every regeneration.
+    pub pairing: RwLock<String>,
+    /// Cumulative rejected pairing attempts (brute-force visibility).
+    pub rejected: AtomicUsize,
+    /// Rotation generation. Every session subscribes; `ServerCtl` bumps it
+    /// on regenerate so live sessions close themselves promptly. (Aborting
+    /// the axum-server task only drops the listener — established sessions
+    /// are detached tasks and would otherwise linger.)
+    pub generation: watch::Sender<u64>,
 }
 
 impl Shared {
@@ -107,44 +126,171 @@ async fn ws_handler(ws: WebSocketUpgrade, State(shared): State<Arc<Shared>>) -> 
     ws.on_upgrade(move |socket| handle_socket(socket, shared))
 }
 
-async fn handle_socket(socket: WebSocket, shared: Arc<Shared>) {
-    shared.clients.fetch_add(1, Ordering::SeqCst);
-    shared.log("phone connected (ws)");
-    let remainders = Remainders::default();
-    let mut rx = shared.mobile_tx.subscribe();
+/// Pairing handshake: the socket must open with
+/// `{"type":"hello","pair":"<8hex>"}` matching the current QR code.
+/// Returns false on timeout, close, error, or 3 bad codes.
+async fn authenticate<S, E>(receiver: &mut S, shared: &Shared, timeout: Duration) -> bool
+where
+    S: Stream<Item = Result<Message, E>> + Unpin,
+{
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    let mut attempts = 0u8;
+    loop {
+        tokio::select! {
+            _ = &mut deadline => {
+                shared.log("ws: pairing hello timeout, closing");
+                return false;
+            }
+            msg = receiver.next() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        if is_valid_hello(&text, shared) {
+                            return true;
+                        }
+                        attempts += 1;
+                        let n = shared.rejected.fetch_add(1, Ordering::SeqCst) + 1;
+                        shared.log("ws: rejected bad pairing code");
+                        if n % 20 == 0 {
+                            shared.log(format!(
+                                "ws: {n} rejected pairing attempts total — \
+                                 unknown device may be probing port 1313"
+                            ));
+                        }
+                        if attempts >= 3 {
+                            return false;
+                        }
+                    }
+                    // Close / end / error during handshake: gone.
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return false,
+                    // Binary / ping / pong during handshake: ignore.
+                    Some(Ok(_)) => {}
+                }
+            }
+        }
+    }
+}
 
+/// Check one candidate `hello` frame against the current pairing code.
+fn is_valid_hello(text: &str, shared: &Shared) -> bool {
+    let Ok(v) = serde_json::from_str::<Value>(text) else {
+        return false;
+    };
+    if v.get("type").and_then(Value::as_str) != Some("hello") {
+        return false;
+    }
+    let Some(code) = v.get("pair").and_then(Value::as_str) else {
+        return false;
+    };
+    let expected = shared
+        .pairing
+        .read()
+        .map(|s| s.clone())
+        .unwrap_or_else(|e| e.into_inner().clone());
+    codes_equal(code, &expected)
+}
+
+/// Constant-time string equality (lengths are fixed and public, but the
+/// code itself must not leak through early exit).
+fn codes_equal(a: &str, b: &str) -> bool {
+    let (x, y) = (a.as_bytes(), b.as_bytes());
+    if x.len() != y.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..x.len() {
+        diff |= x[i] ^ y[i];
+    }
+    diff == 0
+}
+
+async fn handle_socket(socket: WebSocket, shared: Arc<Shared>) {
     let (mut sender, mut receiver) = socket.split();
 
+    // Pairing gate: the first message must echo the QR pairing code.
+    // Unpaired sockets are closed before they can send input or receive
+    // clipboard broadcasts.
+    if !authenticate(&mut receiver, &shared, Duration::from_secs(10)).await {
+        let _ = sender.send(Message::Close(None)).await;
+        return;
+    }
+
+    shared.clients.fetch_add(1, Ordering::SeqCst);
+    shared.log("phone paired (wss)");
+    let remainders = Remainders::default();
+    let mut rx = shared.mobile_tx.subscribe();
+    let mut gen_rx = shared.generation.subscribe();
+
     // Forward broadcast text-mobile messages to this phone. Runs until either
-    // the phone disconnects (sender closed) or the task is aborted below.
+    // the phone disconnects (sender closed), pairing rotates, or the task is
+    // aborted below.
+    let gen_kick = shared.generation.subscribe();
     let forward = tokio::spawn(async move {
-        while let Ok(text) = rx.recv().await {
-            let payload = serde_json::json!({"type": "text-mobile", "text": text});
-            if sender
-                .send(Message::Text(payload.to_string().into()))
-                .await
-                .is_err()
-            {
-                break;
+        let mut gen_kick = gen_kick;
+        loop {
+            tokio::select! {
+                text = rx.recv() => {
+                    let Ok(text) = text else { break };
+                    let payload = serde_json::json!({"type": "text-mobile", "text": text});
+                    if sender
+                        .send(Message::Text(payload.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                _ = gen_kick.changed() => {
+                    // Pairing rotated: end the session politely.
+                    let _ = sender.send(Message::Close(None)).await;
+                    break;
+                }
             }
         }
     });
 
-    while let Some(msg) = receiver.next().await {
-        match msg {
-            Ok(Message::Text(text)) => match serde_json::from_str::<Value>(&text) {
-                Ok(v) => dispatch(&v, &shared, &remainders),
-                Err(_) => shared.log(format!("ws: ignoring non-JSON frame: {text}")),
-            },
-            Ok(Message::Close(_)) => break,
-            // Binary / ping / pong: nothing to do.
-            Ok(_) => {}
-            Err(_) => break,
+    let mut kicked = false;
+    loop {
+        tokio::select! {
+            msg = receiver.next() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        match serde_json::from_str::<Value>(&text) {
+                            Ok(v) => dispatch(&v, &shared, &remainders),
+                            Err(_) => shared.log(format!("ws: ignoring non-JSON frame: {text}")),
+                        }
+                    }
+                    // Close / end / error: gone.
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                    // Binary / ping / pong: nothing to do.
+                    Some(Ok(_)) => {}
+                }
+            }
+            _ = gen_rx.changed() => {
+                // Pairing rotated (regenerate button / network change):
+                // the forward task delivers the Close frame; just exit.
+                // (Dropping our halves would also kill the TCP connection.)
+                shared.log("phone session ended by certificate regeneration");
+                kicked = true;
+                break;
+            }
         }
     }
 
-    forward.abort();
-    shared.clients.fetch_sub(1, Ordering::SeqCst);
+    if kicked {
+        // Give the forward task a moment to deliver the Close frame
+        // instead of racing it with an abort.
+        let _ = tokio::time::timeout(Duration::from_secs(2), forward).await;
+    } else {
+        forward.abort();
+    }
+    // Saturating: a regeneration reset may already have zeroed the counter.
+    shared
+        .clients
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
+            Some(c.saturating_sub(1))
+        })
+        .ok();
     shared.log("phone disconnected (ws)");
 }
 
@@ -264,12 +410,8 @@ async fn root() -> impl IntoResponse {
 
 const SERVER_RESPONSE: &str = "peyara";
 
-/// Serve forever on `0.0.0.0:1313`.
-pub async fn serve(app: axum::Router) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", PORT)).await?;
-    axum::serve(listener, app).await?;
-    Ok(())
-}
+// NOTE: serving is TLS-only via `crate::tls::serve_tls`; there is
+// intentionally no plaintext `serve()` here.
 
 #[cfg(test)]
 mod tests {
@@ -282,11 +424,15 @@ mod tests {
         let (input_tx, _) = std::sync::mpsc::channel::<InputCommand>();
         let (ui_tx, _) = std::sync::mpsc::channel::<UiEvent>();
         let (mobile_tx, _) = broadcast::channel::<String>(16);
+        let (generation, _) = watch::channel(0u64);
         Arc::new(Shared {
             clients: AtomicUsize::new(0),
             input_tx,
             ui_tx,
             mobile_tx,
+            pairing: RwLock::new("a1b2c3d4".to_owned()),
+            rejected: AtomicUsize::new(0),
+            generation,
         })
     }
 
@@ -298,12 +444,16 @@ mod tests {
         let (input_tx, input_rx) = std::sync::mpsc::channel::<InputCommand>();
         let (ui_tx, ui_rx) = std::sync::mpsc::channel::<UiEvent>();
         let (mobile_tx, _) = broadcast::channel::<String>(16);
+        let (generation, _) = watch::channel(0u64);
         (
             Arc::new(Shared {
                 clients: AtomicUsize::new(0),
                 input_tx,
                 ui_tx,
                 mobile_tx,
+                pairing: RwLock::new("a1b2c3d4".to_owned()),
+                rejected: AtomicUsize::new(0),
+                generation,
             }),
             input_rx,
             ui_rx,
@@ -484,5 +634,213 @@ mod tests {
         let mut rx = shared.mobile_tx.subscribe();
         assert_eq!(shared.send_to_phone("hi"), 1);
         assert_eq!(rx.recv().await.unwrap(), "hi");
+    }
+
+    #[test]
+    fn codes_equal_is_exact() {
+        assert!(codes_equal("a1b2c3d4", "a1b2c3d4"));
+        assert!(!codes_equal("a1b2c3d4", "a1b2c3d5"));
+        assert!(!codes_equal("a1b2c3d4", "a1b2c3d"));
+        assert!(!codes_equal("a1b2c3d4", "a1b2c3d44"));
+        assert!(!codes_equal("", "a1b2c3d4"));
+    }
+
+    #[test]
+    fn hello_validation() {
+        let (shared, _, _) = test_shared_with_rx(); // pairing = a1b2c3d4
+        assert!(is_valid_hello(
+            r#"{"type":"hello","pair":"a1b2c3d4"}"#,
+            &shared
+        ));
+        assert!(!is_valid_hello(
+            r#"{"type":"hello","pair":"00000000"}"#,
+            &shared
+        ));
+        assert!(!is_valid_hello(r#"{"type":"hello"}"#, &shared));
+        assert!(!is_valid_hello(r#"{"type":"coordinates","x":1}"#, &shared));
+        assert!(!is_valid_hello("not json", &shared));
+        // Rotation invalidates the old code.
+        *shared.pairing.write().unwrap() = "ffffffff".to_owned();
+        assert!(!is_valid_hello(
+            r#"{"type":"hello","pair":"a1b2c3d4"}"#,
+            &shared
+        ));
+        assert!(is_valid_hello(
+            r#"{"type":"hello","pair":"ffffffff"}"#,
+            &shared
+        ));
+    }
+
+    fn hello_stream(msgs: Vec<&str>) -> impl Stream<Item = Result<Message, axum::Error>> + Unpin {
+        futures_util::stream::iter(
+            msgs.into_iter()
+                .map(|m| Ok(Message::Text(m.to_owned().into())))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auth_accepts_correct_hello_first_try() {
+        let (shared, _, _) = test_shared_with_rx();
+        let mut rx = hello_stream(vec![r#"{"type":"hello","pair":"a1b2c3d4"}"#]);
+        assert!(authenticate(&mut rx, &shared, Duration::from_secs(5)).await);
+        assert_eq!(shared.rejected.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auth_tolerates_one_strike_then_hello() {
+        let (shared, _, _) = test_shared_with_rx();
+        let mut rx = hello_stream(vec![
+            r#"{"type":"coordinates","x":1,"y":1}"#,
+            r#"{"type":"hello","pair":"a1b2c3d4"}"#,
+        ]);
+        assert!(authenticate(&mut rx, &shared, Duration::from_secs(5)).await);
+        assert_eq!(shared.rejected.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auth_closes_after_three_bad_codes() {
+        let (shared, _, _) = test_shared_with_rx();
+        let mut rx = hello_stream(vec![
+            r#"{"type":"hello","pair":"00000000"}"#,
+            r#"{"type":"hello","pair":"11111111"}"#,
+            r#"{"type":"hello","pair":"22222222"}"#,
+            r#"{"type":"hello","pair":"a1b2c3d4"}"#, // never reached
+        ]);
+        assert!(!authenticate(&mut rx, &shared, Duration::from_secs(5)).await);
+        assert_eq!(shared.rejected.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auth_times_out_on_silence() {
+        let (shared, _, _) = test_shared_with_rx();
+        let mut rx = futures_util::stream::pending::<Result<Message, axum::Error>>();
+        assert!(
+            !authenticate(&mut rx, &shared, Duration::from_millis(50)).await,
+            "silent socket must be closed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auth_rejects_immediate_close() {
+        let (shared, _, _) = test_shared_with_rx();
+        let mut rx =
+            futures_util::stream::iter(vec![Ok::<Message, axum::Error>(Message::Close(None))]);
+        assert!(!authenticate(&mut rx, &shared, Duration::from_secs(5)).await);
+    }
+
+    // --- Raw-socket end-to-end: pair a live session, then kick it --------
+
+    /// Minimal WS client frame: masked text (client frames MUST be masked).
+    fn ws_masked_text(payload: &str) -> Vec<u8> {
+        let bytes = payload.as_bytes();
+        assert!(bytes.len() < 126, "test payload too large");
+        let mask = [0x11u8, 0x22, 0x33, 0x44];
+        let mut frame = vec![0x81, 0x80 | bytes.len() as u8];
+        frame.extend_from_slice(&mask);
+        frame.extend(bytes.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+        frame
+    }
+
+    /// Read one server→client frame (unmasked). Returns (opcode, payload).
+    async fn ws_read_frame(s: &mut tokio::net::TcpStream) -> Option<(u8, Vec<u8>)> {
+        use tokio::io::AsyncReadExt;
+        let mut hdr = [0u8; 2];
+        tokio::time::timeout(Duration::from_secs(5), s.read_exact(&mut hdr))
+            .await
+            .ok()?
+            .ok()?;
+        let opcode = hdr[0] & 0x0F;
+        let mut len = (hdr[1] & 0x7F) as u64;
+        if len == 126 {
+            let mut ext = [0u8; 2];
+            s.read_exact(&mut ext).await.ok()?;
+            len = u16::from_be_bytes(ext) as u64;
+        } else if len == 127 {
+            let mut ext = [0u8; 8];
+            s.read_exact(&mut ext).await.ok()?;
+            len = u64::from_be_bytes(ext);
+        }
+        let mut payload = vec![0u8; len as usize];
+        if len > 0 {
+            s.read_exact(&mut payload).await.ok()?;
+        }
+        Some((opcode, payload))
+    }
+
+    /// Raw TCP + RFC 6455 handshake against `/ws`. Returns the connected stream.
+    async fn ws_raw_connect(port: u16) -> tokio::net::TcpStream {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        s.write_all(
+            b"GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\
+              Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+              Sec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            let n = s.read(&mut tmp).await.unwrap();
+            assert!(n > 0, "handshake: server closed early");
+            buf.extend_from_slice(&tmp[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let head = String::from_utf8_lossy(&buf);
+        assert!(head.contains("101"), "handshake failed: {head}");
+        s
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn generation_bump_kicks_live_session() {
+        use tokio::io::AsyncWriteExt;
+        let (shared, input_rx, _) = test_shared_with_rx(); // pairing = a1b2c3d4
+        let app = build(shared.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        // Pair over a raw socket.
+        let mut s = ws_raw_connect(port).await;
+        s.write_all(&ws_masked_text(r#"{"type":"hello","pair":"a1b2c3d4"}"#))
+            .await
+            .unwrap();
+        // Prove the session is live: input arrives server-side.
+        s.write_all(&ws_masked_text(r#"{"type":"coordinates","x":5,"y":0}"#))
+            .await
+            .unwrap();
+        assert!(matches!(
+            input_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            InputCommand::MouseMove { x: 5, y: 0 }
+        ));
+        // Wait until the server counted us, so the kick assertion is tight.
+        for _ in 0..50 {
+            if shared.clients.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(shared.clients.load(Ordering::SeqCst), 1);
+
+        // Rotate (what ServerCtl::regenerate does): sessions must be kicked.
+        let _ = shared.generation.send(1);
+
+        // The server must deliver a Close frame (0x8), not linger.
+        let (opcode, _) = ws_read_frame(&mut s).await.expect("no frame after kick");
+        assert_eq!(opcode, 0x8, "expected Close frame after generation bump");
+
+        // And the client counter must drain back to zero (no underflow).
+        for _ in 0..50 {
+            if shared.clients.load(Ordering::SeqCst) == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(shared.clients.load(Ordering::SeqCst), 0);
     }
 }

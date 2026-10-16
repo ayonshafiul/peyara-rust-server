@@ -86,16 +86,28 @@ under that tag. The tag must match the `version` in `Cargo.toml`
 |---|---|
 | GUI | `eframe` / `egui` |
 | QR code | `qrcode` (pure Rust, rendered to an egui texture) |
-| HTTP + WebSocket server | `axum` (native WebSockets, `GET /ws`) |
+| HTTPS + secure WebSocket server | `axum` + `axum-server` (rustls, `GET /` + `GET /ws`, TLS-only) |
+| Ephemeral certificate | `rcgen` (fresh self-signed cert per launch, in memory only) |
+| Fingerprint | SHA-256 of cert DER (`sha2` + `hex`), carried in the QR |
 | Mouse / keyboard | `enigo` on a dedicated worker thread |
 | Clipboard | `arboard` |
 
-Phone → PC messages (JSON over `ws://<host>:1313/ws`): `coordinates`, `clicks`, `scroll`,
-`windowdragstart`/`windowdragupdate`/`windowdragend`, `key`, `media-key`,
-`edit-key`, `text`. PC → phone: `text-mobile`. `GET /` answers `"peyara"`
-for discovery/QR verification. See
+🔒 **TLS-only + paired.** The first launch mints a self-signed certificate and
+pairing code, persisted in the OS config dir (`~/.config/peyara-egui/` on
+Linux) so phones stay paired across restarts; the phone pins the cert via the
+`sha256:` fingerprint in the QR code, then pairs with the 8-digit `pair:`
+code from the same QR (shown on screen for manual entry). Unpaired connections
+are closed before they can send input or receive clipboard text — a random
+LAN device can no longer connect. Phone → PC messages (JSON over `wss://<host>:1313/ws`, after
+`{"type":"hello","pair":…}`): `coordinates`,
+`clicks`, `scroll`, `windowdragstart`/`windowdragupdate`/`windowdragend`,
+`key`, `media-key`, `edit-key`, `text`. PC → phone: `text-mobile`.
+`GET https://<host>:1313/` answers `"peyara"` for discovery/QR verification.
+Pressing **Regenerate certificate** (under the QR code) mints a new cert
+live — connected phones drop and must scan again. See
+[`docs/qr-code-format.md`](docs/qr-code-format.md) for the QR spec and
 [`docs/websocket-client-migration.md`](docs/websocket-client-migration.md)
-for the exact shapes (replaces the old socket.io protocol).
+for the message shapes.
 
 ## Wayland (Ubuntu 24 default session)
 
@@ -115,11 +127,12 @@ reports the detected session type and backend status. As a fallback, pick
 
 ## Project layout
 
-- `src/main.rs` — startup: input thread, Tokio server task, QR payload, window
-- `src/server.rs` — HTTP + WebSocket routes (`GET /`, `GET /ws`)
+- `src/main.rs` — startup: input thread, ephemeral cert, TLS server task, QR payload, window
+- `src/tls.rs` — cert generation, fingerprint, TLS-only serving + verification
+- `src/server.rs` — HTTPS + secure WebSocket routes (`GET /`, `GET /ws`)
 - `src/input.rs` — phone commands → `enigo` key/button mapping
-- `src/netinfo.rs` — LAN addresses, QR payload (`version,<peyara>,host,urls…`)
-- `src/app.rs` — egui window
+- `src/netinfo.rs` — LAN addresses, QR payload (`version,<peyara>,host,sha256:fp,urls…`)
+- `src/app.rs` — egui window (QR + regenerate-certificate button)
 
 ## Contributing
 
