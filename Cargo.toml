@@ -53,3 +53,7 @@ qrcode = "0.14"
 image = "0.25"
 if-addrs = "0.15"
 hostname = "0.4"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Accessibility permission check/prompt (AXIsProcessTrusted*).
+macos-accessibility-client = "0.0.2"

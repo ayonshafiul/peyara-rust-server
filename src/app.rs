@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use crate::{
     netinfo::{self, LanAddr},
+    permissions::{self, PermissionState},
     server::{Shared, UiEvent},
     ServerCtl,
 };
@@ -79,6 +80,14 @@ pub struct PeyaraApp {
     net_pending: bool,
     last_net_poll: Instant,
     regen_confirm: bool,
+    // macOS Accessibility tracking (stubbed Granted elsewhere).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    backend_retry_tx: Sender<()>,
+    // macOS Accessibility tracking (stubbed Granted elsewhere).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    perm_state: PermissionState,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    last_perm_poll: Instant,
 }
 
 /// Constructor bundle for [`PeyaraApp`] (keeps the arg list small).
@@ -93,6 +102,7 @@ pub struct AppInit {
     pub pairing: String,
     pub ui_rx: Receiver<UiEvent>,
     pub worker_log_rx: Receiver<String>,
+    pub backend_retry_tx: Sender<()>,
 }
 
 fn theme(ctx: &egui::Context) {
@@ -142,6 +152,7 @@ impl PeyaraApp {
             pairing,
             ui_rx,
             worker_log_rx,
+            backend_retry_tx,
         } = init;
         let qr = cc.egui_ctx.load_texture(
             "peyara-qr",
@@ -170,6 +181,9 @@ impl PeyaraApp {
             net_pending: false,
             last_net_poll: Instant::now(),
             regen_confirm: false,
+            backend_retry_tx,
+            perm_state: permissions::input_permission_state(),
+            last_perm_poll: Instant::now(),
         }
     }
 
@@ -263,6 +277,80 @@ impl PeyaraApp {
             .iter()
             .find(|a| a.ip == host)
             .map(|a| a.name.as_str())
+    }
+
+    /// macOS Accessibility card: status + explicit grant buttons.
+    #[cfg(target_os = "macos")]
+    fn show_permission_card(&mut self, ui: &mut egui::Ui) {
+        let granted = self.perm_state == PermissionState::Granted;
+        card_frame().show(ui, |ui| {
+            section_title(ui, "🔐", "Input permission");
+            ui.horizontal(|ui| {
+                status_dot(ui, if granted { GREEN } else { AMBER }, 9.0);
+                ui.label(
+                    RichText::new(if granted {
+                        "Accessibility granted — mouse & keyboard work."
+                    } else {
+                        "Accessibility missing — the phone connects but input won't move."
+                    })
+                    .size(13.0)
+                    .color(MUTED),
+                );
+            });
+            if !granted {
+                ui.label(
+                    RichText::new(
+                        "macOS only lets apps control the mouse/keyboard after an explicit \
+                         grant. Press Request Access, approve the system dialog, then enable \
+                         Peyara under System Settings → Privacy & Security → Accessibility.",
+                    )
+                    .size(12.0)
+                    .color(MUTED),
+                );
+                ui.add_space(4.0);
+            }
+            ui.horizontal(|ui| {
+                if ui
+                    .add_sized(
+                        [150.0, 32.0],
+                        egui::Button::new("Request Access…").corner_radius(CornerRadius::same(8)),
+                    )
+                    .clicked()
+                {
+                    match permissions::request_input_permission() {
+                        PermissionState::Granted => {
+                            self.perm_state = PermissionState::Granted;
+                            self.set_status("Accessibility granted — input enabled.");
+                            self.push_log("accessibility granted; input enabled");
+                            let _ = self.backend_retry_tx.send(());
+                        }
+                        PermissionState::Missing => {
+                            self.perm_state = PermissionState::Missing;
+                            self.set_status("Still missing — enable Peyara in System Settings.");
+                            self.push_log(
+                                "accessibility still missing after prompt; open System Settings",
+                            );
+                        }
+                    }
+                }
+                if ui
+                    .add_sized(
+                        [210.0, 32.0],
+                        egui::Button::new("Open Accessibility Settings")
+                            .corner_radius(CornerRadius::same(8)),
+                    )
+                    .clicked()
+                {
+                    permissions::open_accessibility_settings();
+                }
+                if ui.small_button("Check again").clicked() {
+                    self.perm_state = permissions::input_permission_state();
+                    let _ = self.backend_retry_tx.send(());
+                    self.set_status("Permission re-checked.");
+                }
+            });
+        });
+        ui.add_space(10.0);
     }
 
     fn poll_channels(&mut self, ctx: &egui::Context) {
@@ -365,6 +453,28 @@ impl eframe::App for PeyaraApp {
             if netinfo::lan_addrs() != self.addrs {
                 self.push_log("network change detected — refreshing");
                 self.start_net_refresh(false);
+            }
+        }
+        // Re-check the OS input permission occasionally; a fresh grant
+        // (user toggled it in System Settings) re-arms the input backend.
+        // macOS only — other platforms report Granted unconditionally.
+        #[cfg(target_os = "macos")]
+        if self.last_perm_poll.elapsed() > Duration::from_secs(3) {
+            self.last_perm_poll = Instant::now();
+            let now_state = permissions::input_permission_state();
+            if now_state != self.perm_state {
+                self.perm_state = now_state;
+                match now_state {
+                    PermissionState::Granted => {
+                        self.set_status("Accessibility granted — input enabled.");
+                        self.push_log("accessibility granted; input enabled");
+                        let _ = self.backend_retry_tx.send(());
+                    }
+                    PermissionState::Missing => {
+                        self.set_status("Accessibility permission missing.");
+                        self.push_log("accessibility permission missing");
+                    }
+                }
             }
         }
         let clients = self.shared.clients.load(Ordering::SeqCst);
@@ -477,21 +587,13 @@ impl eframe::App for PeyaraApp {
                             .color(MUTED)
                             .strong(),
                     );
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(&self.pairing)
-                                .monospace()
-                                .size(22.0)
-                                .strong()
-                                .color(ACCENT),
-                        );
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.small_button("Copy").clicked() {
-                                let code = self.pairing.clone();
-                                self.copy_to_clipboard(&code, "Pairing code");
-                            }
-                        });
-                    });
+                    ui.label(
+                        RichText::new(&self.pairing)
+                            .monospace()
+                            .size(22.0)
+                            .strong()
+                            .color(ACCENT),
+                    );
                     ui.label(
                         RichText::new("Enter this on the phone if the camera can't scan.")
                             .size(11.0)
@@ -510,10 +612,6 @@ impl eframe::App for PeyaraApp {
                             .size(9.5)
                             .color(MUTED),
                     );
-                    if ui.small_button("Copy fingerprint").clicked() {
-                        let fp = self.fingerprint.clone();
-                        self.copy_to_clipboard(&fp, "Fingerprint");
-                    }
                 });
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
@@ -576,6 +674,10 @@ impl eframe::App for PeyaraApp {
                         ui.label(RichText::new(&self.status_line).size(13.0).color(MUTED));
                     });
                     ui.add_space(6.0);
+
+                    // macOS Accessibility grant card.
+                    #[cfg(target_os = "macos")]
+                    self.show_permission_card(ui);
 
                     // Text sharing.
                     card_frame().show(ui, |ui| {

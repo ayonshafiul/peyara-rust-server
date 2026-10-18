@@ -10,6 +10,7 @@
 mod app;
 mod input;
 mod netinfo;
+mod permissions;
 mod server;
 mod tls;
 
@@ -97,7 +98,7 @@ impl ServerCtl {
 
 fn main() {
     // 1. Input worker (owns the enigo backend on its own thread).
-    let (input_tx, worker_log_rx) = input::spawn_input_worker();
+    let (input_tx, worker_log_rx, backend_retry_tx) = input::spawn_input_worker();
     let (ui_tx, ui_rx) = mpsc::channel::<UiEvent>();
 
     // 2. LAN addresses first: they become certificate SANs (no server needed).
@@ -220,6 +221,7 @@ fn main() {
                     pairing: pairing.clone(),
                     ui_rx,
                     worker_log_rx,
+                    backend_retry_tx: backend_retry_tx.clone(),
                 },
             )))
         }),

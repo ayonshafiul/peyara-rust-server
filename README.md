@@ -125,6 +125,23 @@ or it never appears, relaunch the app and watch the in-app Log panel, which
 reports the detected session type and backend status. As a fallback, pick
 "Ubuntu on Xorg" at the login screen, where plain X11 injection works.
 
+## macOS (Accessibility permission)
+
+Controlling the mouse/keyboard requires the app to be listed under System
+Settings → Privacy & Security → Accessibility. Peyara shows an **Input
+permission** card with the current status and two explicit actions:
+
+1. **Request Access…** — shows macOS's own system prompt; approving it still
+   requires toggling Peyara on in System Settings (the prompt deep-links
+   there).
+2. **Open Accessibility Settings** — jumps straight to the right pane.
+
+The app re-checks every few seconds: granting access enables input
+immediately, no restart needed. If the backend dies at runtime (e.g. the
+permission is revoked), Peyara rebuilds it automatically a few times, then
+asks you to fix the permission and press **Check again** (which also retries
+the backend) instead of spamming prompts.
+
 ## Project layout
 
 - `src/main.rs` — startup: input thread, ephemeral cert, TLS server task, QR payload, window

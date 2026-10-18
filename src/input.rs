@@ -6,7 +6,18 @@
 //! unit-tested (`cargo test`).
 
 use enigo::{Button, Direction, Enigo, Key, Keyboard, Mouse, Settings};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::time::{Duration, Instant};
+
+/// How long the worker waits before retrying a dead backend on its own.
+/// The UI Retry button bypasses this immediately.
+const BACKEND_RETRY_GAP: Duration = Duration::from_secs(5);
+/// Identical backend errors are logged at most this often (no UI log floods).
+const ERROR_LOG_GAP: Duration = Duration::from_secs(2);
+/// After this many consecutive failed auto-rebuilds the worker stops trying
+/// on its own and waits for a manual retry (avoids prompt/beep loops when
+/// the user denied access or the portal is gone).
+const MAX_AUTO_REBUILDS: u32 = 5;
 
 /// Commands sent by the mobile client (mirrors the WebSocket `type` messages
 /// documented in `docs/websocket-client-migration.md`).
@@ -185,16 +196,40 @@ fn session_kind() -> &'static str {
     }
 }
 
+/// Protocol-level failure = the backend session itself is dead (portal or
+/// compositor dropped us), as opposed to one bad command. Only then is a
+/// rebuild worthwhile.
+fn is_backend_dead(e: &enigo::InputError) -> bool {
+    matches!(e, enigo::InputError::Simulate(_))
+}
+
+/// Pure throttle check: log `msg` if it differs from the last logged error
+/// or enough time has passed. Unit-tested.
+fn should_log_error(last: &Option<(String, Instant)>, msg: &str, now: Instant) -> bool {
+    match last {
+        None => true,
+        Some((m, t)) => m != msg || now.duration_since(*t) >= ERROR_LOG_GAP,
+    }
+}
+
 /// Spawn the dedicated input worker thread. Returns a channel sender for
-/// [`InputCommand`]s plus a log line receiver for UI diagnostics.
+/// [`InputCommand`]s, a log line receiver for UI diagnostics, and a retry
+/// sender that forces an immediate backend rebuild (UI Retry button /
+/// permission-granted poll).
 ///
 /// On Wayland (e.g. Ubuntu 24's default GNOME session) X11 injection only
 /// reaches XWayland windows, so enigo must go through the Remote Desktop
 /// portal (libei). That pops up a one-time system permission prompt which
 /// the user has to approve.
-pub fn spawn_input_worker() -> (Sender<InputCommand>, mpsc::Receiver<String>) {
+///
+/// Unlike the first version, the worker never exits when the backend dies:
+/// a dead portal session (compositor restart, idle expiry, suspend) is
+/// detected via [`is_backend_dead`] and the backend is rebuilt with
+/// backoff, so input recovers without an app restart.
+pub fn spawn_input_worker() -> (Sender<InputCommand>, mpsc::Receiver<String>, Sender<()>) {
     let (cmd_tx, cmd_rx) = mpsc::channel::<InputCommand>();
     let (log_tx, log_rx) = mpsc::channel::<String>();
+    let (retry_tx, retry_rx) = mpsc::channel::<()>();
 
     std::thread::spawn(move || {
         let session = session_kind();
@@ -206,40 +241,153 @@ pub fn spawn_input_worker() -> (Sender<InputCommand>, mpsc::Receiver<String>) {
                     .to_owned(),
             );
         }
+        #[cfg(target_os = "macos")]
+        let _ = log_tx.send(
+            "macOS detected: Accessibility permission is required — check the \
+             Permissions card and grant access."
+                .to_owned(),
+        );
         // Match the snappy delays of the original robotjs setup
         // (mouse 1ms, keyboard 2ms); only affects the X11 backend.
         let settings = Settings {
             linux_delay: 1,
             ..Settings::default()
         };
-        let mut enigo = match Enigo::new(&settings) {
-            Ok(e) => {
-                let _ = log_tx.send("input backend ready".to_owned());
-                Some(e)
+        let mut backend = init_backend(&settings, &log_tx, session);
+        let mut last_attempt = Instant::now();
+        let mut auto_failures: u32 = 0;
+        let mut last_err: Option<(String, Instant)> = None;
+        // Log helper with flood protection.
+        let log_err = |last_err: &mut Option<(String, Instant)>,
+                       log_tx: &mpsc::Sender<String>,
+                       msg: String| {
+            let now = Instant::now();
+            if should_log_error(last_err, &msg, now) {
+                *last_err = Some((msg.clone(), now));
+                let _ = log_tx.send(msg);
             }
-            Err(e) => {
-                let _ = log_tx.send(format!("input backend unavailable: {e}"));
-                if session.starts_with("wayland") {
-                    let _ = log_tx.send(
-                        "Wayland fix: make sure xdg-desktop-portal is running and relaunch \
-                         the app so you can approve the Remote Desktop prompt."
-                            .to_owned(),
-                    );
+        };
+
+        loop {
+            // Manual retry (UI button / permission granted): rebuild now.
+            if retry_rx.try_recv().is_ok() {
+                while retry_rx.try_recv().is_ok() {}
+                if backend.is_none() {
+                    backend = init_backend(&settings, &log_tx, session);
+                    last_attempt = Instant::now();
+                    auto_failures = 0;
                 }
-                None
             }
-        };
-        let Some(enigo) = enigo.as_mut() else {
-            return;
-        };
-        for cmd in cmd_rx {
-            if let Err(e) = execute(enigo, cmd) {
-                let _ = log_tx.send(format!("input error: {e}"));
+            match cmd_rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(cmd) => match backend.as_mut() {
+                    Some(e) => match execute(e, cmd) {
+                        Ok(()) => {
+                            auto_failures = 0;
+                        }
+                        Err(err) => {
+                            if is_backend_dead(&err) {
+                                log_err(
+                                    &mut last_err,
+                                    &log_tx,
+                                    format!("input backend lost ({err}); reconnecting…"),
+                                );
+                                // One immediate rebuild for transient blips;
+                                // sustained failure falls through to the
+                                // gated retries below.
+                                backend = init_backend(&settings, &log_tx, session);
+                                if backend.is_none() {
+                                    last_attempt = Instant::now();
+                                    auto_failures += 1;
+                                } else {
+                                    auto_failures = 0;
+                                }
+                                if auto_failures >= MAX_AUTO_REBUILDS {
+                                    log_err(
+                                        &mut last_err,
+                                        &log_tx,
+                                        "input backend keeps failing — fix the permission/portal, \
+                                         then press Retry input backend."
+                                            .to_owned(),
+                                    );
+                                }
+                            } else {
+                                log_err(&mut last_err, &log_tx, format!("input error: {err}"));
+                            }
+                        }
+                    },
+                    None => {
+                        // Backend down: rebuild at most every BACKEND_RETRY_GAP
+                        // (and stop auto-retrying after repeated failures),
+                        // else drop this command to avoid stale-motion bursts.
+                        let may_retry = last_attempt.elapsed() >= BACKEND_RETRY_GAP
+                            && auto_failures < MAX_AUTO_REBUILDS;
+                        if may_retry {
+                            backend = init_backend(&settings, &log_tx, session);
+                            last_attempt = Instant::now();
+                            if backend.is_none() {
+                                auto_failures += 1;
+                            }
+                        }
+                        match backend.as_mut() {
+                            Some(e) => {
+                                if let Err(err) = execute(e, cmd) {
+                                    log_err(&mut last_err, &log_tx, format!("input error: {err}"));
+                                    if is_backend_dead(&err) {
+                                        backend = None;
+                                        auto_failures += 1;
+                                    } else {
+                                        auto_failures = 0;
+                                    }
+                                } else {
+                                    auto_failures = 0;
+                                }
+                            }
+                            None => {
+                                log_err(
+                                    &mut last_err,
+                                    &log_tx,
+                                    "input dropped: backend unavailable".to_owned(),
+                                );
+                            }
+                        }
+                    }
+                },
+                Err(RecvTimeoutError::Timeout) => {
+                    // Idle tick: retry signals are checked at the top of
+                    // the loop; nothing else to do.
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
             }
         }
     });
 
-    (cmd_tx, log_rx)
+    (cmd_tx, log_rx, retry_tx)
+}
+
+/// Try to create the enigo backend, logging the outcome. `None` means the
+/// worker must keep going without input until a retry succeeds.
+fn init_backend(
+    settings: &Settings,
+    log_tx: &mpsc::Sender<String>,
+    session: &str,
+) -> Option<Enigo> {
+    match Enigo::new(settings) {
+        Ok(e) => {
+            let _ = log_tx.send("input backend ready".to_owned());
+            Some(e)
+        }
+        Err(e) => {
+            let _ = log_tx.send(format!("input backend unavailable: {e}"));
+            if session.starts_with("wayland") {
+                let _ = log_tx.send(
+                    "Wayland fix: make sure xdg-desktop-portal is running and relaunch \
+                     the app so you can approve the Remote Desktop prompt."
+                        .to_owned(),
+                );
+            }
+            None
+        }
+    }
 }
 
 fn execute(enigo: &mut Enigo, cmd: InputCommand) -> Result<(), enigo::InputError> {
@@ -374,8 +522,31 @@ mod tests {
     }
 
     #[test]
+    fn backend_death_classification() {
+        use enigo::InputError;
+        assert!(is_backend_dead(&InputError::Simulate("protocol gone")));
+        assert!(!is_backend_dead(&InputError::Mapping("x".to_owned())));
+        assert!(!is_backend_dead(&InputError::Unmapping("x".to_owned())));
+        assert!(!is_backend_dead(&InputError::NoEmptyKeycodes));
+        assert!(!is_backend_dead(&InputError::InvalidInput("bad")));
+    }
+
+    #[test]
+    fn error_log_throttle() {
+        let now = Instant::now();
+        assert!(should_log_error(&None, "x", now));
+        let last = Some(("x".to_owned(), now));
+        // Same message, immediately: suppressed.
+        assert!(!should_log_error(&last, "x", now));
+        // Different message: logged.
+        assert!(should_log_error(&last, "y", now));
+        // Same message after the gap: logged.
+        assert!(should_log_error(&last, "x", now + ERROR_LOG_GAP));
+    }
+
+    #[test]
     fn worker_channel_roundtrip() {
-        let (tx, _log) = spawn_input_worker();
+        let (tx, _log, _retry) = spawn_input_worker();
         // May fail headless (no display for enigo); must not panic either way.
         let _ = tx.send(InputCommand::MouseMove { x: 0, y: 0 });
     }
