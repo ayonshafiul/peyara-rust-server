@@ -146,17 +146,18 @@ pub fn map_media_key(name: &str) -> Option<Key> {
 
 /// Resolve the `key` socket event payload to an [`InputCommand`].
 ///
-/// Faithful port of the `socket.on("key")` handler in `src/main.js`:
-/// single ASCII-lowercase/digit chars are tapped, everything else is typed;
-/// `backspace`/`enter` are tapped as special keys.
+/// Port of the `socket.on("key")` handler in `src/main.js`, with one
+/// deliberate change: every single character is *typed*, never tapped.
+/// Tapping `Key::Unicode(c)` makes enigo resolve the character through the
+/// keyboard layout (TIS/`UCKeyTranslate` on macOS), and those HIToolbox APIs
+/// enforce a main-thread-only queue assertion — called from our input worker
+/// thread they kill the process outright (`dispatch_assert_queue_fail`,
+/// EXC_BREAKPOINT). Typing posts a CGEvent carrying the unicode string
+/// instead: thread-safe, layout-independent, and correct for uppercase and
+/// non-ASCII too. `backspace`/`enter` and other named keys are still tapped —
+/// they map to fixed keycodes, no layout lookup involved.
 pub fn resolve_key_event(key: &str) -> InputCommand {
     if key.chars().count() == 1 {
-        let c = key.chars().next().unwrap();
-        if c.is_ascii_lowercase() || c.is_ascii_digit() {
-            return InputCommand::KeyPress {
-                key: Key::Unicode(c),
-            };
-        }
         return InputCommand::TypeText {
             text: key.to_owned(),
         };
@@ -176,12 +177,85 @@ pub fn resolve_key_event(key: &str) -> InputCommand {
 }
 
 /// Resolve a key name inside an `edit-key` payload.
+///
+/// On macOS a single character resolves to its ANSI virtual keycode
+/// ([`ansi_keycode`]) instead of `Key::Unicode`: enigo maps `Key::Unicode`
+/// through the main-thread-only TIS layout API, which traps the process when
+/// invoked from the input worker thread. Unmappable characters fall back to
+/// `Key::Unicode('\0')`, which enigo turns into a no-op.
 pub fn resolve_edit_key(key: &str) -> Key {
     if key.chars().count() == 1 {
-        Key::Unicode(key.chars().next().unwrap())
+        let c = key.chars().next().unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            ansi_keycode(c)
+                .map(|code| Key::Other(code as u32))
+                .unwrap_or(Key::Unicode('\0'))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Key::Unicode(c)
+        }
     } else {
         map_named_key(key).unwrap_or(Key::Unicode('\0'))
     }
+}
+
+/// ANSI virtual keycodes (HIToolbox `Events.h`) for printable ASCII, matched
+/// case-insensitively. Shortcuts are defined by physical key on macOS, so this
+/// works on any keyboard layout. Only used on the [`resolve_edit_key`] path.
+#[cfg(target_os = "macos")]
+fn ansi_keycode(c: char) -> Option<u16> {
+    Some(match c.to_ascii_lowercase() {
+        'a' => 0x00,
+        's' => 0x01,
+        'd' => 0x02,
+        'f' => 0x03,
+        'h' => 0x04,
+        'g' => 0x05,
+        'z' => 0x06,
+        'x' => 0x07,
+        'c' => 0x08,
+        'v' => 0x09,
+        'b' => 0x0B,
+        'q' => 0x0C,
+        'w' => 0x0D,
+        'e' => 0x0E,
+        'r' => 0x0F,
+        'y' => 0x10,
+        't' => 0x11,
+        '1' => 0x12,
+        '2' => 0x13,
+        '3' => 0x14,
+        '4' => 0x15,
+        '6' => 0x16,
+        '5' => 0x17,
+        '=' => 0x18,
+        '9' => 0x19,
+        '7' => 0x1A,
+        '-' => 0x1B,
+        '8' => 0x1C,
+        '0' => 0x1D,
+        ']' => 0x1E,
+        'o' => 0x1F,
+        'u' => 0x20,
+        '[' => 0x21,
+        'i' => 0x22,
+        'p' => 0x23,
+        'l' => 0x25,
+        'j' => 0x26,
+        '\'' => 0x27,
+        'k' => 0x28,
+        ';' => 0x29,
+        '\\' => 0x2A,
+        ',' => 0x2B,
+        '/' => 0x2C,
+        'n' => 0x2D,
+        'm' => 0x2E,
+        '.' => 0x2F,
+        '`' => 0x32,
+        _ => return None,
+    })
 }
 
 /// What kind of desktop session we run in. Determines which input backend
@@ -492,23 +566,22 @@ mod tests {
     }
 
     #[test]
-    fn key_event_resolution_matches_original_js() {
+    fn key_event_resolution_types_single_chars() {
+        // Single characters are typed (never layout-tapped): see the
+        // resolve_key_event doc comment about the macOS TIS trap.
         assert!(matches!(
             resolve_key_event("a"),
-            InputCommand::KeyPress {
-                key: Key::Unicode('a')
-            }
+            InputCommand::TypeText { .. }
         ));
         assert!(matches!(
             resolve_key_event("5"),
-            InputCommand::KeyPress {
-                key: Key::Unicode('5')
-            }
+            InputCommand::TypeText { .. }
         ));
         assert!(matches!(
             resolve_key_event("A"),
             InputCommand::TypeText { .. }
         ));
+        assert!(matches!(resolve_key_event("é"), InputCommand::TypeText { .. }));
         assert!(matches!(
             resolve_key_event("backspace"),
             InputCommand::KeyPress {
@@ -519,6 +592,29 @@ mod tests {
             resolve_key_event("Enter"),
             InputCommand::KeyPress { key: Key::Return }
         ));
+    }
+
+    #[test]
+    fn edit_keys_resolve_without_tis_lookup() {
+        // Named keys map to fixed keycodes everywhere.
+        assert_eq!(resolve_edit_key("f5"), Key::F5);
+        assert_eq!(resolve_edit_key("left"), Key::LeftArrow);
+        // Unknown multi-char names no-op.
+        assert_eq!(resolve_edit_key("nope"), Key::Unicode('\0'));
+        // Single characters must not become Key::Unicode on macOS (TIS trap).
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(resolve_edit_key("c"), Key::Other(0x08));
+            assert_eq!(resolve_edit_key("C"), Key::Other(0x08));
+            assert_eq!(resolve_edit_key("a"), Key::Other(0x00));
+            assert_eq!(resolve_edit_key("5"), Key::Other(0x17));
+            // Non-ANSI characters no-op rather than hitting the layout API.
+            assert_eq!(resolve_edit_key("é"), Key::Unicode('\0'));
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(resolve_edit_key("c"), Key::Unicode('c'));
+        }
     }
 
     #[test]
