@@ -1,6 +1,6 @@
 [package]
 name = "peyara-egui"
-version = "2.3.0"
+version = "2.4.0"
 description = "Peyara Remote Mouse Server (Rust + egui): wireless touchpad, keyboard and clipboard sharing from mobile devices"
 authors = ["Shafiul Muslebeen"]
 edition = "2021"
