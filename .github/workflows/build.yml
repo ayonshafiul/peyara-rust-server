@@ -29,6 +29,10 @@ jobs:
             libxcb-xfixes0-dev \
             libxkbcommon-dev \
             libxkbcommon-x11-dev \
+            libxcb-ewmh-dev \
+            libxcb-randr0-dev \
+            libdbus-1-dev \
+            pkg-config \
             libwayland-dev \
             libegl1-mesa-dev \
             libgl1-mesa-dev
