@@ -16,9 +16,10 @@
 //! * Phone -> server: first `hello`, then `{"type": "<event>", ...}` where
 //!   `<event>` is one of `coordinates`, `clicks`, `scroll`,
 //!   `windowdragstart`, `windowdragupdate`, `windowdragend`, `key`,
-//!   `media-key`, `edit-key`, `text` (see
-//!   `docs/websocket-client-migration.md` for shapes).
-//! * Server -> phone: `{"type": "text-mobile", "text": "..."}`.
+//!   `media-key`, `edit-key`, `text`, `get-active-app`, `action` (see
+//!   `docs/shortcut-deck.md` for the last two).
+//! * Server -> phone: `{"type": "text-mobile", "text": "..."}` and
+//!   `{"type": "active-app", "app": ..., "slug": ..., ...}`.
 //!
 //! Screen-sharing signalling (`offer`/`answer`/ICE) from the original is
 //! intentionally omitted.
@@ -42,6 +43,7 @@ use std::sync::{
 use std::time::Duration;
 use tokio::sync::{broadcast, watch};
 
+use crate::active_app;
 use crate::input::{
     map_button, map_media_key, map_modifier, resolve_edit_key, resolve_key_event, InputCommand,
 };
@@ -221,9 +223,18 @@ async fn handle_socket(socket: WebSocket, shared: Arc<Shared>) {
     let mut rx = shared.mobile_tx.subscribe();
     let mut gen_rx = shared.generation.subscribe();
 
-    // Forward broadcast text-mobile messages to this phone. Runs until either
-    // the phone disconnects (sender closed), pairing rotates, or the task is
-    // aborted below.
+    // Replies for request/response messages (`get-active-app`). The main loop
+    // pushes JSON strings here; the forward task owns the socket sender.
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    // Auto-push active-app once after connection open so the phone can pick
+    // the right shortcut deck without an extra round-trip.
+    let initial = active_app::payload_or_unknown().to_string();
+    let _ = reply_tx.send(initial);
+
+    // Forward broadcast text-mobile + direct replies to this phone. Runs until
+    // either the phone disconnects (sender closed), pairing rotates, or the
+    // task is aborted below.
     let gen_kick = shared.generation.subscribe();
     let forward = tokio::spawn(async move {
         let mut gen_kick = gen_kick;
@@ -234,6 +245,16 @@ async fn handle_socket(socket: WebSocket, shared: Arc<Shared>) {
                     let payload = serde_json::json!({"type": "text-mobile", "text": text});
                     if sender
                         .send(Message::Text(payload.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                reply = reply_rx.recv() => {
+                    let Some(reply) = reply else { break };
+                    if sender
+                        .send(Message::Text(reply.into()))
                         .await
                         .is_err()
                     {
@@ -256,7 +277,11 @@ async fn handle_socket(socket: WebSocket, shared: Arc<Shared>) {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<Value>(&text) {
-                            Ok(v) => dispatch(&v, &shared, &remainders),
+                            Ok(v) => {
+                                if let Some(reply) = dispatch(&v, &shared, &remainders) {
+                                    let _ = reply_tx.send(reply.to_string());
+                                }
+                            }
                             Err(_) => shared.log(format!("ws: ignoring non-JSON frame: {text}")),
                         }
                     }
@@ -285,17 +310,20 @@ async fn handle_socket(socket: WebSocket, shared: Arc<Shared>) {
         forward.abort();
     }
     // Saturating: a regeneration reset may already have zeroed the counter.
-    shared
+    #[allow(deprecated)]
+    let _ = shared
         .clients
         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
             Some(c.saturating_sub(1))
-        })
-        .ok();
+        });
     shared.log("phone disconnected (ws)");
 }
 
 /// Route one decoded client JSON message to the input/UI channels.
-fn dispatch(v: &Value, shared: &Shared, remainders: &Remainders) {
+///
+/// Returns an optional server->phone JSON reply (for `get-active-app`).
+/// `action` is fire-and-forget (returns `None`) to avoid spamming the phone.
+fn dispatch(v: &Value, shared: &Shared, remainders: &Remainders) -> Option<Value> {
     let kind = v.get("type").and_then(Value::as_str).unwrap_or("");
     match kind {
         "coordinates" => {
@@ -347,28 +375,11 @@ fn dispatch(v: &Value, shared: &Shared, remainders: &Remainders) {
             }
         }
         "edit-key" => {
-            let Some(key_name) = str_field(v, &["key"]) else {
-                return;
-            };
+            let key_name = str_field(v, &["key"])?;
             if key_name.is_empty() {
-                return;
+                return None;
             }
-            let mut modifiers = Vec::new();
-            match v.get("modifier") {
-                Some(Value::String(m)) => {
-                    if let Some(k) = map_modifier(m) {
-                        modifiers.push(k);
-                    }
-                }
-                Some(Value::Array(list)) => {
-                    for m in list.iter().filter_map(Value::as_str) {
-                        if let Some(k) = map_modifier(m) {
-                            modifiers.push(k);
-                        }
-                    }
-                }
-                _ => {}
-            }
+            let modifiers = parse_modifiers(v);
             let _ = shared.input_tx.send(InputCommand::EditKey {
                 key: resolve_edit_key(&key_name),
                 modifiers,
@@ -379,6 +390,14 @@ fn dispatch(v: &Value, shared: &Shared, remainders: &Remainders) {
                 let _ = shared.ui_tx.send(UiEvent::IncomingText(text));
             }
         }
+        "get-active-app" => {
+            return Some(active_app::payload_or_unknown());
+        }
+        "action" => {
+            if let Some(cmd) = parse_action(v, shared) {
+                let _ = shared.input_tx.send(cmd);
+            }
+        }
         "" => {
             shared.log("ws: ignoring message without \"type\"");
         }
@@ -386,6 +405,80 @@ fn dispatch(v: &Value, shared: &Shared, remainders: &Remainders) {
             shared.log(format!("ws: ignoring unknown type \"{other}\""));
         }
     }
+    None
+}
+
+/// Parse `modifier` (string) or `modifiers` (array) from edit-key/action payloads.
+fn parse_modifiers(v: &Value) -> Vec<enigo::Key> {
+    let mut modifiers = Vec::new();
+    // Singular `modifier: "ctrl"` (legacy edit-key shape).
+    if let Some(Value::String(m)) = v.get("modifier") {
+        if let Some(k) = map_modifier(m) {
+            modifiers.push(k);
+        }
+    }
+    // Plural `modifiers: ["ctrl","shift"]` (preferred for action).
+    if let Some(list) = v.get("modifiers").and_then(Value::as_array) {
+        for m in list.iter().filter_map(Value::as_str) {
+            if let Some(k) = map_modifier(m) {
+                modifiers.push(k);
+            }
+        }
+    }
+    // Legacy `modifier: ["ctrl"]` array shape.
+    if let Some(list) = v.get("modifier").and_then(Value::as_array) {
+        for m in list.iter().filter_map(Value::as_str) {
+            if let Some(k) = map_modifier(m) {
+                modifiers.push(k);
+            }
+        }
+    }
+    modifiers
+}
+
+/// Parse an `action` (shortcut-deck) payload into an [`InputCommand::Shortcut`].
+///
+/// Schema (see `docs/shortcut-deck.md`):
+/// `{"type":"action","key":"t","modifiers":["ctrl"],"pressDurationMs":50,
+///   "pressCount":1,"actionId":"...","code":"KeyW"}`.
+/// `code` is reserved for future raw-input/scancode mode (v1 ignores it).
+fn parse_action(v: &Value, shared: &Shared) -> Option<InputCommand> {
+    let key_name = str_field(v, &["key"])?;
+    if key_name.is_empty() {
+        return None;
+    }
+    let key = resolve_edit_key(&key_name);
+    if key == enigo::Key::Unicode('\0') {
+        shared.log(format!(
+            "ws: ignoring action with unknown key \"{key_name}\""
+        ));
+        return None;
+    }
+    let modifiers = parse_modifiers(v);
+    let hold_ms = v
+        .get("pressDurationMs")
+        .and_then(|n| n.as_u64().or_else(|| n.as_i64().map(|i| i.max(0) as u64)))
+        .unwrap_or(0)
+        .min(5000);
+    let repeats = v
+        .get("pressCount")
+        .and_then(|n| n.as_u64().or_else(|| n.as_i64().map(|i| i.max(0) as u64)))
+        .unwrap_or(1)
+        .clamp(1, 10) as u32;
+    let code = v.get("code").and_then(Value::as_str).map(|s| s.to_owned());
+    if code.is_some() {
+        shared.log("ws: action `code` is reserved for v2 raw-input; ignoring");
+    }
+    if let Some(id) = v.get("actionId").and_then(Value::as_str) {
+        shared.log(format!("ws: action \"{id}\""));
+    }
+    Some(InputCommand::Shortcut {
+        key,
+        modifiers,
+        hold: std::time::Duration::from_millis(hold_ms),
+        repeats,
+        code,
+    })
 }
 
 /// First present string field among `keys` (accepts aliases for tolerance).
@@ -565,7 +658,7 @@ mod tests {
         let (shared, input_rx, ui_rx) = test_shared_with_rx();
         let rem = Remainders::default();
 
-        dispatch(
+        let _ = dispatch(
             &serde_json::json!({"type": "coordinates", "x": 3.2, "y": 0.0}),
             &shared,
             &rem,
@@ -575,7 +668,7 @@ mod tests {
             InputCommand::MouseMove { x: 3, y: 0 }
         ));
 
-        dispatch(
+        let _ = dispatch(
             &serde_json::json!({"type": "clicks", "finger": "right", "doubleTap": true}),
             &shared,
             &rem,
@@ -585,7 +678,7 @@ mod tests {
             InputCommand::Click { double: true, .. }
         ));
 
-        dispatch(
+        let _ = dispatch(
             &serde_json::json!({"type": "scroll", "x": 0, "y": 2.0}),
             &shared,
             &rem,
@@ -603,7 +696,7 @@ mod tests {
             serde_json::json!({"type": "media-key", "key": "audio_mute"}),
             serde_json::json!({"type": "edit-key", "key": "c", "modifier": "ctrl"}),
         ] {
-            dispatch(&msg, &shared, &rem);
+            let _ = dispatch(&msg, &shared, &rem);
         }
         // 3 drag/key/media/edit-key inputs above produce 6 commands total
         // (dragstart, dragmove, dragend, key, mediakey, editkey); 3 consumed
@@ -612,7 +705,7 @@ mod tests {
             let _ = input_rx.recv_timeout(Duration::from_secs(1));
         }
 
-        dispatch(
+        let _ = dispatch(
             &serde_json::json!({"type": "text", "text": "hello"}),
             &shared,
             &rem,
@@ -623,8 +716,98 @@ mod tests {
         ));
 
         // Unknown types and missing types are ignored (no new commands).
-        dispatch(&serde_json::json!({"type": "nope"}), &shared, &rem);
-        dispatch(&serde_json::json!({"x": 1}), &shared, &rem);
+        let _ = dispatch(&serde_json::json!({"type": "nope"}), &shared, &rem);
+        let _ = dispatch(&serde_json::json!({"x": 1}), &shared, &rem);
+        assert!(input_rx.recv_timeout(Duration::from_millis(50)).is_err());
+    }
+
+    #[test]
+    fn dispatch_get_active_app_replies() {
+        let (shared, _, _) = test_shared_with_rx();
+        let rem = Remainders::default();
+        let reply = dispatch(
+            &serde_json::json!({"type": "get-active-app"}),
+            &shared,
+            &rem,
+        );
+        let v = reply.expect("get-active-app must reply");
+        assert_eq!(v.get("type").and_then(Value::as_str), Some("active-app"));
+        assert!(v.get("app").and_then(Value::as_str).is_some());
+        assert!(v.get("slug").and_then(Value::as_str).is_some());
+        assert!(v.get("os").and_then(Value::as_str).is_some());
+    }
+
+    #[test]
+    fn dispatch_action_parses_modifiers_timing() {
+        let (shared, input_rx, _) = test_shared_with_rx();
+        let rem = Remainders::default();
+        let reply = dispatch(
+            &serde_json::json!({
+                "type": "action",
+                "actionId": "chrome-new-tab",
+                "key": "t",
+                "modifiers": ["ctrl"],
+                "pressDurationMs": 120,
+                "pressCount": 2,
+            }),
+            &shared,
+            &rem,
+        );
+        // Fire-and-forget: no reply frame.
+        assert!(reply.is_none());
+        match input_rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+            InputCommand::Shortcut {
+                hold,
+                repeats,
+                code,
+                ..
+            } => {
+                assert_eq!(hold, std::time::Duration::from_millis(120));
+                assert_eq!(repeats, 2);
+                assert_eq!(code, None);
+            }
+            other => panic!("expected Shortcut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_action_clamps_and_tolerates_shapes() {
+        let (shared, input_rx, _) = test_shared_with_rx();
+        let rem = Remainders::default();
+        // Legacy singular `modifier` + oversized timing values clamp.
+        let _ = dispatch(
+            &serde_json::json!({
+                "type": "action",
+                "key": "s",
+                "modifier": "ctrl",
+                "pressDurationMs": 99999,
+                "pressCount": 99,
+                "code": "KeyS",
+            }),
+            &shared,
+            &rem,
+        );
+        match input_rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+            InputCommand::Shortcut {
+                hold,
+                repeats,
+                code,
+                modifiers,
+                ..
+            } => {
+                assert_eq!(hold, std::time::Duration::from_millis(5000));
+                assert_eq!(repeats, 10);
+                assert_eq!(code.as_deref(), Some("KeyS"));
+                assert_eq!(modifiers.len(), 1);
+            }
+            other => panic!("expected Shortcut, got {other:?}"),
+        }
+        // Unknown key -> ignored, no command.
+        let _ = dispatch(
+            &serde_json::json!({"type": "action", "key": "definitely-not-a-key-xyz"}),
+            &shared,
+            &rem,
+        );
         assert!(input_rx.recv_timeout(Duration::from_millis(50)).is_err());
     }
 
@@ -826,6 +1009,13 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert_eq!(shared.clients.load(Ordering::SeqCst), 1);
+
+        // Drain the auto-pushed active-app frame (opcode 0x1) sent right
+        // after hello, so the kick assertion below sees the Close frame.
+        let (opcode, payload) = ws_read_frame(&mut s).await.expect("no active-app frame");
+        assert_eq!(opcode, 0x1, "expected initial active-app text frame");
+        let v: Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(v.get("type").and_then(Value::as_str), Some("active-app"));
 
         // Rotate (what ServerCtl::regenerate does): sessions must be kicked.
         let _ = shared.generation.send(1);

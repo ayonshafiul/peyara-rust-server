@@ -7,6 +7,7 @@
 //! TLS-only: every launch mints a fresh self-signed certificate in memory
 //! (regenerable from the UI); the phone pins it via the QR fingerprint.
 
+mod active_app;
 mod app;
 mod input;
 mod netinfo;

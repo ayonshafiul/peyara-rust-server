@@ -61,7 +61,8 @@ Linux needs the GUI/input system libraries:
 sudo apt-get install -y \
   libx11-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev \
   libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev \
-  libwayland-dev libegl1-mesa-dev libgl1-mesa-dev
+  libwayland-dev libegl1-mesa-dev libgl1-mesa-dev \
+  libxcb-ewmh-dev libxcb-randr0-dev libdbus-1-dev pkg-config
 ```
 
 Windows and macOS need nothing extra. Useful checks before a PR:

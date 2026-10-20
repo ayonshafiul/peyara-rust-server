@@ -43,6 +43,22 @@ pub enum InputCommand {
     MediaKey { key: Key },
     /// Key + modifiers (`edit-key` event, `{key, modifier}`).
     EditKey { key: Key, modifiers: Vec<Key> },
+    /// Shortcut-deck action (`action` event).
+    ///
+    /// `hold` = how long to hold the main key before release (clamped
+    /// 0..=5000ms at parse time). `repeats` = how many times to tap
+    /// (clamped 1..=10). `code` is reserved for a future scancode/raw-input
+    /// mode for games (v1 ignores it, see `docs/shortcut-deck.md`).
+    Shortcut {
+        key: Key,
+        modifiers: Vec<Key>,
+        hold: Duration,
+        repeats: u32,
+        /// Reserved for v2 scancode/raw-input (`code: "KeyW"`). v1 stores
+        /// and ignores it.
+        #[allow(dead_code)]
+        code: Option<String>,
+    },
 }
 
 /// Map a mouse button name from the mobile client to enigo.
@@ -508,6 +524,34 @@ fn execute(enigo: &mut Enigo, cmd: InputCommand) -> Result<(), enigo::InputError
                 enigo.key(*m, Direction::Release)?;
             }
         }
+        InputCommand::Shortcut {
+            key,
+            modifiers,
+            hold,
+            repeats,
+            ..
+        } => {
+            let taps = repeats.clamp(1, 10);
+            let hold = hold.min(Duration::from_secs(5));
+            for i in 0..taps {
+                for m in &modifiers {
+                    enigo.key(*m, Direction::Press)?;
+                }
+                if hold.is_zero() {
+                    enigo.key(key, Direction::Click)?;
+                } else {
+                    enigo.key(key, Direction::Press)?;
+                    std::thread::sleep(hold);
+                    enigo.key(key, Direction::Release)?;
+                }
+                for m in modifiers.iter().rev() {
+                    enigo.key(*m, Direction::Release)?;
+                }
+                if i + 1 < taps {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -581,7 +625,10 @@ mod tests {
             resolve_key_event("A"),
             InputCommand::TypeText { .. }
         ));
-        assert!(matches!(resolve_key_event("é"), InputCommand::TypeText { .. }));
+        assert!(matches!(
+            resolve_key_event("é"),
+            InputCommand::TypeText { .. }
+        ));
         assert!(matches!(
             resolve_key_event("backspace"),
             InputCommand::KeyPress {
