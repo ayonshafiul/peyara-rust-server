@@ -1,13 +1,38 @@
-# Peyara Server
+# Peyara Server — Free Stream Deck for PC
+
+Wi-Fi remote mouse + **free Stream Deck** for your Windows/Linux/Mac PCs. Open
+the Deck from the touchpad, pick your app (or let it auto-follow the focused
+desktop app), and tap to fire shortcuts and macros — with hundreds of presets,
+per-app action search, and custom layouts.
+
+## Install
+
+Download the latest [**release**](https://github.com/ayonshafiul/peyara-rust-server/releases) and pick your file:
+
+| OS | File | Install |
+|---|---|---|
+| Windows | `Peyara-Server-<version>-windows-x86_64-setup.exe` | run the installer |
+| macOS (Apple Silicon) | `Peyara-Server-<version>-macos-arm64.dmg` | open, drag to Applications |
+| Debian / Ubuntu | `Peyara-Server-<version>-linux-amd64.deb` | `sudo dpkg -i <file>` |
+| Fedora / RPM | `Peyara-Server-<version>-linux-x86_64.rpm` | `sudo rpm -i <file>` |
+
+- **Windows:** allow the app on **private networks** when the firewall asks.
+- **macOS:** unsigned build — clear quarantine, then grant **Accessibility**:
+  ```sh
+  sudo xattr -cr /Applications/Peyara*.app
+  ```
+- **Linux (Wayland):** approve the "remote interaction" prompt on first launch.
+
+Launch the app and scan the QR code with the mobile app; both devices must be on the same Wi-Fi. Updating keeps your pairing — just install the new package.
 
 [![Build](https://github.com/ayonshafiul/peyara-rust-server/actions/workflows/build.yml/badge.svg)](https://github.com/ayonshafiul/peyara-rust-server/actions)
 [![Latest release](https://img.shields.io/github/v/release/ayonshafiul/peyara-rust-server)](https://github.com/ayonshafiul/peyara-rust-server/releases)
 [![Downloads](https://img.shields.io/github/downloads/ayonshafiul/peyara-rust-server/total)](https://github.com/ayonshafiul/peyara-rust-server/releases)
 [![License](https://img.shields.io/github/license/ayonshafiul/peyara-rust-server)](LICENSE)
 
-Turn your phone into a wireless touchpad, keyboard, and clipboard for your
-PC. Peyara Server runs on your desktop and pairs with the [Peyara mobile
-app](https://peyara-remote-mouse.vercel.app/) over your local network —
+Turn your phone into a wireless touchpad, keyboard, clipboard, and free Stream
+Deck for your PC. Peyara Server runs on your desktop and pairs with the [Peyara
+mobile app](https://peyara-remote-mouse.vercel.app/) over your local network —
 just scan the QR code on screen.
 
 This is a pure-Rust rewrite of the [original Electron
@@ -18,33 +43,11 @@ unchanged. Screen sharing was intentionally dropped to keep it light.
 ## Features
 
 - 🖱️ **Touchpad** — move, click (left/right/middle, double-tap), drag, scroll
+- 🎛️ **Free Stream Deck** — hundreds of app presets, action search, custom layouts
 - ⌨️ **Keyboard** — type text, special keys, media keys, key combos
 - 📋 **Clipboard sharing** — send text to the phone, receive text from it
 - 🔳 **QR pairing** — no typing IP addresses; scan and connect
 - 🪶 **Lightweight** — one small native binary, no Electron, no Node.js
-
-## Download
-
-Grab the latest release for your OS from the [**Releases**
-page](https://github.com/ayonshafiul/peyara-rust-server/releases):
-
-| OS | File | Install |
-|---|---|---|
-| Linux (Debian/Ubuntu/…) | `Peyara-Server-<ver>-linux-amd64.deb` | `sudo dpkg -i <file>` |
-| Linux (Fedora/…) | `Peyara-Server-<ver>-linux-x86_64.rpm` | `sudo rpm -i <file>` |
-| Windows | `Peyara-Server-<ver>-windows-x86_64-setup.exe` | run the installer wizard |
-| macOS (Apple Silicon) | `Peyara-Server-<ver>-macos-arm64.dmg` | open it, drag the app to Applications |
-
-> Windows SmartScreen and macOS Gatekeeper may warn on first launch because
-> community builds aren't commercially signed — this is expected.
-
-## Quick start
-
-1. Start Peyara Server on your PC.
-2. Connect your phone to the **same Wi-Fi**.
-3. Scan the on-screen QR code with the Peyara mobile app.
-4. On GNOME/Wayland, approve the one-time "remote interaction" prompt (see
-   [Wayland](#wayland-ubuntu-24-default-session)).
 
 ## Build from source
 
