@@ -302,6 +302,171 @@ fn should_log_error(last: &Option<(String, Instant)>, msg: &str, now: Instant) -
     }
 }
 
+/// Pointer motion is re-emitted to the OS on this fixed tick (250 Hz)
+/// instead of the moment a packet arrives.
+const PACE_TICK: Duration = Duration::from_millis(4);
+/// Fraction of the pending motion emitted per tick. 0.45 drains a burst to
+/// ~10% within 16ms, for ~5ms of added average latency.
+const PACE_ALPHA: f64 = 0.45;
+/// Pending motion at or below this distance (px) is emitted in one go, so
+/// a glide always settles exactly instead of decaying forever.
+const PACE_SNAP: f64 = 1.0;
+/// How long the worker sleeps between polls while no motion is pending.
+const IDLE_WAIT: Duration = Duration::from_millis(500);
+
+/// Smooths pointer motion between the network and the OS.
+///
+/// Wi-Fi delivers pointer packets in bursts (radio power-save, frame
+/// aggregation), and applying each burst instantly makes the cursor jump.
+/// The pacer collects motion and releases a fixed fraction of it every
+/// [`PACE_TICK`], turning bursts into short glides and steady 60/120 Hz
+/// phone input into even 250 Hz steps. Spacing the OS moves also matters on
+/// macOS: enigo's relative move reads the cursor position back, and reads
+/// taken between back-to-back events return a stale position that silently
+/// drops motion. Both axes drain by the same fraction, so the direction of
+/// travel is preserved; fractional pixels carry over and nothing is lost.
+#[derive(Debug, Default)]
+struct MotionPacer {
+    pending: (f64, f64),
+    remainder: (f64, f64),
+}
+
+impl MotionPacer {
+    fn push(&mut self, dx: i32, dy: i32) {
+        self.pending.0 += f64::from(dx);
+        self.pending.1 += f64::from(dy);
+    }
+
+    fn is_idle(&self) -> bool {
+        self.pending == (0.0, 0.0)
+    }
+
+    /// Whole-pixel motion to apply on this tick.
+    fn step(&mut self) -> (i32, i32) {
+        let (px, py) = self.pending;
+        if px.hypot(py) <= PACE_SNAP {
+            self.flush()
+        } else {
+            self.emit(px * PACE_ALPHA, py * PACE_ALPHA)
+        }
+    }
+
+    /// Everything still pending, at once.
+    fn flush(&mut self) -> (i32, i32) {
+        let (px, py) = self.pending;
+        self.emit(px, py)
+    }
+
+    fn emit(&mut self, dx: f64, dy: f64) -> (i32, i32) {
+        self.pending = (self.pending.0 - dx, self.pending.1 - dy);
+        if self.pending.0.abs() < 1e-9 && self.pending.1.abs() < 1e-9 {
+            self.pending = (0.0, 0.0);
+        }
+        let x = dx + self.remainder.0;
+        let y = dy + self.remainder.1;
+        let (qx, qy) = (x.round(), y.round());
+        self.remainder = (x - qx, y - qy);
+        (qx as i32, qy as i32)
+    }
+}
+
+/// Owns the enigo backend and its failure/rebuild bookkeeping.
+struct Worker {
+    settings: Settings,
+    session: &'static str,
+    log_tx: Sender<String>,
+    backend: Option<Enigo>,
+    last_attempt: Instant,
+    auto_failures: u32,
+    last_err: Option<(String, Instant)>,
+}
+
+impl Worker {
+    /// Log helper with flood protection.
+    fn log_err(&mut self, msg: String) {
+        let now = Instant::now();
+        if should_log_error(&self.last_err, &msg, now) {
+            self.last_err = Some((msg.clone(), now));
+            let _ = self.log_tx.send(msg);
+        }
+    }
+
+    /// Manual retry (UI button / permission granted): rebuild now.
+    fn retry(&mut self) {
+        if self.backend.is_none() {
+            self.backend = init_backend(&self.settings, &self.log_tx, self.session);
+            self.last_attempt = Instant::now();
+            self.auto_failures = 0;
+        }
+    }
+
+    fn run(&mut self, cmd: InputCommand) {
+        match self.backend.as_mut() {
+            Some(e) => match execute(e, cmd) {
+                Ok(()) => {
+                    self.auto_failures = 0;
+                }
+                Err(err) => {
+                    if is_backend_dead(&err) {
+                        self.log_err(format!("input backend lost ({err}); reconnecting…"));
+                        // One immediate rebuild for transient blips;
+                        // sustained failure falls through to the
+                        // gated retries below.
+                        self.backend = init_backend(&self.settings, &self.log_tx, self.session);
+                        if self.backend.is_none() {
+                            self.last_attempt = Instant::now();
+                            self.auto_failures += 1;
+                        } else {
+                            self.auto_failures = 0;
+                        }
+                        if self.auto_failures >= MAX_AUTO_REBUILDS {
+                            self.log_err(
+                                "input backend keeps failing — fix the permission/portal, \
+                                 then press Retry input backend."
+                                    .to_owned(),
+                            );
+                        }
+                    } else {
+                        self.log_err(format!("input error: {err}"));
+                    }
+                }
+            },
+            None => {
+                // Backend down: rebuild at most every BACKEND_RETRY_GAP
+                // (and stop auto-retrying after repeated failures),
+                // else drop this command to avoid stale-motion bursts.
+                let may_retry = self.last_attempt.elapsed() >= BACKEND_RETRY_GAP
+                    && self.auto_failures < MAX_AUTO_REBUILDS;
+                if may_retry {
+                    self.backend = init_backend(&self.settings, &self.log_tx, self.session);
+                    self.last_attempt = Instant::now();
+                    if self.backend.is_none() {
+                        self.auto_failures += 1;
+                    }
+                }
+                match self.backend.as_mut() {
+                    Some(e) => {
+                        if let Err(err) = execute(e, cmd) {
+                            self.log_err(format!("input error: {err}"));
+                            if is_backend_dead(&err) {
+                                self.backend = None;
+                                self.auto_failures += 1;
+                            } else {
+                                self.auto_failures = 0;
+                            }
+                        } else {
+                            self.auto_failures = 0;
+                        }
+                    }
+                    None => {
+                        self.log_err("input dropped: backend unavailable".to_owned());
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Spawn the dedicated input worker thread. Returns a channel sender for
 /// [`InputCommand`]s, a log line receiver for UI diagnostics, and a retry
 /// sender that forces an immediate backend rebuild (UI Retry button /
@@ -316,6 +481,10 @@ fn should_log_error(last: &Option<(String, Instant)>, msg: &str, now: Instant) -
 /// a dead portal session (compositor restart, idle expiry, suspend) is
 /// detected via [`is_backend_dead`] and the backend is rebuilt with
 /// backoff, so input recovers without an app restart.
+///
+/// Pointer motion goes through a [`MotionPacer`]; every other command first
+/// flushes the pending motion so clicks, drag presses/releases and keys land
+/// where the pointer visibly is.
 pub fn spawn_input_worker() -> (Sender<InputCommand>, mpsc::Receiver<String>, Sender<()>) {
     let (cmd_tx, cmd_rx) = mpsc::channel::<InputCommand>();
     let (log_tx, log_rx) = mpsc::channel::<String>();
@@ -343,110 +512,61 @@ pub fn spawn_input_worker() -> (Sender<InputCommand>, mpsc::Receiver<String>, Se
             linux_delay: 1,
             ..Settings::default()
         };
-        let mut backend = init_backend(&settings, &log_tx, session);
-        let mut last_attempt = Instant::now();
-        let mut auto_failures: u32 = 0;
-        let mut last_err: Option<(String, Instant)> = None;
-        // Log helper with flood protection.
-        let log_err = |last_err: &mut Option<(String, Instant)>,
-                       log_tx: &mpsc::Sender<String>,
-                       msg: String| {
-            let now = Instant::now();
-            if should_log_error(last_err, &msg, now) {
-                *last_err = Some((msg.clone(), now));
-                let _ = log_tx.send(msg);
-            }
+        let backend = init_backend(&settings, &log_tx, session);
+        let mut worker = Worker {
+            settings,
+            session,
+            log_tx,
+            backend,
+            last_attempt: Instant::now(),
+            auto_failures: 0,
+            last_err: None,
         };
+        let mut pacer = MotionPacer::default();
+        let mut next_tick = Instant::now();
 
         loop {
-            // Manual retry (UI button / permission granted): rebuild now.
             if retry_rx.try_recv().is_ok() {
                 while retry_rx.try_recv().is_ok() {}
-                if backend.is_none() {
-                    backend = init_backend(&settings, &log_tx, session);
-                    last_attempt = Instant::now();
-                    auto_failures = 0;
-                }
+                worker.retry();
             }
-            match cmd_rx.recv_timeout(Duration::from_millis(500)) {
-                Ok(cmd) => match backend.as_mut() {
-                    Some(e) => match execute(e, cmd) {
-                        Ok(()) => {
-                            auto_failures = 0;
-                        }
-                        Err(err) => {
-                            if is_backend_dead(&err) {
-                                log_err(
-                                    &mut last_err,
-                                    &log_tx,
-                                    format!("input backend lost ({err}); reconnecting…"),
-                                );
-                                // One immediate rebuild for transient blips;
-                                // sustained failure falls through to the
-                                // gated retries below.
-                                backend = init_backend(&settings, &log_tx, session);
-                                if backend.is_none() {
-                                    last_attempt = Instant::now();
-                                    auto_failures += 1;
-                                } else {
-                                    auto_failures = 0;
-                                }
-                                if auto_failures >= MAX_AUTO_REBUILDS {
-                                    log_err(
-                                        &mut last_err,
-                                        &log_tx,
-                                        "input backend keeps failing — fix the permission/portal, \
-                                         then press Retry input backend."
-                                            .to_owned(),
-                                    );
-                                }
-                            } else {
-                                log_err(&mut last_err, &log_tx, format!("input error: {err}"));
-                            }
-                        }
-                    },
-                    None => {
-                        // Backend down: rebuild at most every BACKEND_RETRY_GAP
-                        // (and stop auto-retrying after repeated failures),
-                        // else drop this command to avoid stale-motion bursts.
-                        let may_retry = last_attempt.elapsed() >= BACKEND_RETRY_GAP
-                            && auto_failures < MAX_AUTO_REBUILDS;
-                        if may_retry {
-                            backend = init_backend(&settings, &log_tx, session);
-                            last_attempt = Instant::now();
-                            if backend.is_none() {
-                                auto_failures += 1;
-                            }
-                        }
-                        match backend.as_mut() {
-                            Some(e) => {
-                                if let Err(err) = execute(e, cmd) {
-                                    log_err(&mut last_err, &log_tx, format!("input error: {err}"));
-                                    if is_backend_dead(&err) {
-                                        backend = None;
-                                        auto_failures += 1;
-                                    } else {
-                                        auto_failures = 0;
-                                    }
-                                } else {
-                                    auto_failures = 0;
-                                }
-                            }
-                            None => {
-                                log_err(
-                                    &mut last_err,
-                                    &log_tx,
-                                    "input dropped: backend unavailable".to_owned(),
-                                );
-                            }
-                        }
+            let timeout = if pacer.is_idle() {
+                IDLE_WAIT
+            } else {
+                next_tick.saturating_duration_since(Instant::now())
+            };
+            match cmd_rx.recv_timeout(timeout) {
+                Ok(InputCommand::MouseMove { x, y } | InputCommand::DragMove { x, y }) => {
+                    if pacer.is_idle() {
+                        // Start of a motion: first step goes out right away.
+                        next_tick = Instant::now();
                     }
-                },
-                Err(RecvTimeoutError::Timeout) => {
-                    // Idle tick: retry signals are checked at the top of
-                    // the loop; nothing else to do.
+                    pacer.push(x, y);
                 }
+                Ok(cmd) => {
+                    let (x, y) = pacer.flush();
+                    if x != 0 || y != 0 {
+                        worker.run(InputCommand::MouseMove { x, y });
+                    }
+                    worker.run(cmd);
+                }
+                Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
+            }
+            let now = Instant::now();
+            if !pacer.is_idle() && now >= next_tick {
+                let (x, y) = pacer.step();
+                if x != 0 || y != 0 {
+                    // MouseMove and DragMove execute identically: the OS
+                    // turns a move with the button held into a drag.
+                    worker.run(InputCommand::MouseMove { x, y });
+                }
+                // Fixed cadence; after a stall, restart rather than burst
+                // to catch up.
+                next_tick += PACE_TICK;
+                if next_tick < now {
+                    next_tick = now + PACE_TICK;
+                }
             }
         }
     });
@@ -685,6 +805,78 @@ mod tests {
         assert!(should_log_error(&last, "y", now));
         // Same message after the gap: logged.
         assert!(should_log_error(&last, "x", now + ERROR_LOG_GAP));
+    }
+
+    /// Drain the pacer tick by tick; returns (total emitted, ticks taken).
+    fn drain(p: &mut MotionPacer) -> ((i32, i32), usize) {
+        let mut total = (0, 0);
+        let mut ticks = 0;
+        while !p.is_idle() {
+            let (x, y) = p.step();
+            total = (total.0 + x, total.1 + y);
+            ticks += 1;
+            assert!(ticks < 1000, "pacer never settled");
+        }
+        (total, ticks)
+    }
+
+    #[test]
+    fn pacer_emits_all_motion_and_settles() {
+        let mut p = MotionPacer::default();
+        p.push(300, -120);
+        let (total, ticks) = drain(&mut p);
+        assert_eq!(total, (300, -120));
+        // A large burst becomes a short glide, not a jump or a crawl.
+        assert!((5..=20).contains(&ticks), "ticks = {ticks}");
+    }
+
+    #[test]
+    fn pacer_spreads_a_burst() {
+        let mut p = MotionPacer::default();
+        p.push(100, 0);
+        let (first, _) = p.step();
+        assert!(first > 0 && first < 100, "first step = {first}");
+    }
+
+    #[test]
+    fn pacer_small_motion_goes_out_at_once() {
+        let mut p = MotionPacer::default();
+        p.push(1, 0);
+        assert_eq!(p.step(), (1, 0));
+        assert!(p.is_idle());
+    }
+
+    #[test]
+    fn pacer_keeps_direction() {
+        let mut p = MotionPacer::default();
+        p.push(200, 100);
+        while !p.is_idle() {
+            let (x, y) = p.step();
+            // Both axes drain together: x stays ~2× y (±1px rounding).
+            assert!((x - 2 * y).abs() <= 2, "step ({x}, {y})");
+        }
+    }
+
+    #[test]
+    fn pacer_accumulates_streamed_input_exactly() {
+        let mut p = MotionPacer::default();
+        let mut total = (0, 0);
+        for _ in 0..50 {
+            p.push(3, -1);
+            let (x, y) = p.step();
+            total = (total.0 + x, total.1 + y);
+        }
+        let (rest, _) = drain(&mut p);
+        assert_eq!((total.0 + rest.0, total.1 + rest.1), (150, -50));
+    }
+
+    #[test]
+    fn pacer_flush_empties() {
+        let mut p = MotionPacer::default();
+        p.push(57, 9);
+        p.step();
+        let _ = p.flush();
+        assert!(p.is_idle());
     }
 
     #[test]
